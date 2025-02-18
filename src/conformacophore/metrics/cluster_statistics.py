@@ -1,5 +1,5 @@
 import numpy as np
-from metrics.cluster_metrics import ClusterMetrics
+from src.conformacophore.metrics.cluster_metrics import ClusterMetrics
 from typing import List
 
 class ClusterStatistics(ClusterMetrics):

@@ -1,11 +1,11 @@
 import os
 import pytest
-from main import process_filtered_results
+from src.conformacophore.pipeline import Pipeline
 
 @pytest.fixture
 def setup_directories():
-    input_dir = 'path/to/input'
-    output_dir = 'path/to/output'
+    input_dir = 'tests/test_data/input'
+    output_dir = 'tests/test_data/output'
 
     # Ensure the output directory exists
     if not os.path.exists(output_dir):
@@ -21,10 +21,17 @@ def setup_directories():
 
 def test_pipeline(setup_directories):
     input_dir, output_dir = setup_directories
-    target_chains = ['A', 'B']
-    ligand_chain = 'L'
-    molecule_chain = 'X'
+    target_chains = ['A', 'B', 'C']
+    ligand_chain = 'D'
+    molecule_chain = 'A'
 
-    process_filtered_results(input_dir, output_dir, target_chains, ligand_chain, molecule_chain)
+    pipeline = Pipeline(
+        input_dir=input_dir,
+        output_dir=output_dir,
+        target_chains=target_chains,
+        ligand_chain=ligand_chain,
+        molecule_chain=molecule_chain
+    )
+    pipeline.run()
 
     assert os.path.exists(os.path.join(output_dir, "analysis_summary.csv"))

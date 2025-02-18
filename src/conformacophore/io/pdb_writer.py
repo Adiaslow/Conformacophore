@@ -1,5 +1,5 @@
 from Bio.PDB.PDBIO import PDBIO
-from singletons.pdb_header_handler import PDBHeaderHandler
+from src.conformacophore.handlers.pdb_header_handler import PDBHeaderHandler
 from typing import Optional
 
 class CustomPDBIO(PDBIO):

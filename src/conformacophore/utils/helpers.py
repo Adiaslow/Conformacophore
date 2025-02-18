@@ -1,7 +1,7 @@
 import argparse
 import os
 import mdtraj as md
-from typing import List
+from typing import List, Optional
 
 def validate_chain_input(chain: str) -> str:
     """Validate that chain input is a valid chain letter."""

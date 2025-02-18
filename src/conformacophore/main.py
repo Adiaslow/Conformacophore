@@ -1,6 +1,6 @@
 import argparse
-from pipeline import Pipeline
-from utils.helpers import validate_chain_input
+from .pipeline import Pipeline
+from src.conformacophore.utils.helpers import validate_chain_input
 
 def main():
     parser = argparse.ArgumentParser(description='Find representative structures from filtered superimposition results')

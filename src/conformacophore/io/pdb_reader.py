@@ -1,4 +1,4 @@
-from Bio.PDB import PDBParser
+from Bio.PDB.PDBParser import PDBParser
 from Bio.PDB.Structure import Structure
 from Bio.PDB.Model import Model
 from typing import Optional

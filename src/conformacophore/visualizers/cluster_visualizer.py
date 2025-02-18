@@ -31,8 +31,7 @@ class ClusterVisualizer:
         plt.title(f'Clustering Dendrogram - Compound {compound_id}')
         plt.xlabel('Frame')
         plt.ylabel('Distance (Å)')
-        plt.savefig(os.path.join(output_dir, f'compound_{compound_id}_dendrogram.png'),
-                    dpi=dpi, bbox_inches='tight')
+        plt.savefig(os.path.join(output_dir, f'compound_{compound_id}_dendrogram.png'), dpi=dpi, bbox_inches='tight')
         plt.close()
 
         return colors
@@ -45,8 +44,7 @@ class ClusterVisualizer:
         plt.yticks([])
         plt.xlabel('Frame')
         plt.title(f'Cluster Assignment - Compound {compound_id}')
-        plt.savefig(os.path.join(output_dir, f'compound_{compound_id}_linear_projection'),
-                    dpi=dpi, bbox_inches='tight')
+        plt.savefig(os.path.join(output_dir, f'compound_{compound_id}_linear_projection.png'), dpi=dpi, bbox_inches='tight')
         plt.close()
 
     def plot_cluster_sizes(self, clusters, colors, output_dir, compound_id, dpi=300):
@@ -55,13 +53,11 @@ class ClusterVisualizer:
         bars = plt.bar(unique_clusters, counts, color=colors)
         for bar in bars:
             height = bar.get_height()
-            plt.text(bar.get_x() + bar.get_width()/2., height, f'{int(height)}',
-                     ha='center', va='bottom')
+            plt.text(bar.get_x() + bar.get_width()/2., height, f'{int(height)}', ha='center', va='bottom')
         plt.title(f'Cluster Sizes - Compound {compound_id}')
         plt.xlabel('Cluster')
         plt.ylabel('Number of Frames')
-        plt.savefig(os.path.join(output_dir, f'compound_{compound_id}_cluster_sizes.png'),
-                    dpi=dpi, bbox_inches='tight')
+        plt.savefig(os.path.join(output_dir, f'compound_{compound_id}_cluster_sizes.png'), dpi=dpi, bbox_inches='tight')
         plt.close()
 
     def plot_2d_projection(self, rmsd_matrix, clusters, colors, output_dir, compound_id, dpi=300):
@@ -70,7 +66,17 @@ class ClusterVisualizer:
         coords = mds.fit_transform(rmsd_norm)
 
         unique_clusters = np.unique(clusters)
-        cluster_spreads = {cluster_id: np.mean(rmsd_matrix[np.ix_(np.where(clusters == cluster_id)[0], np.where(clusters == cluster_id)[0])][np.nonzero(rmsd_matrix[np.ix_(np.where(clusters == cluster_id)[0], np.where(clusters == cluster_id)[0])])]) for cluster_id in unique_clusters}
+        cluster_spreads = {
+            cluster_id: np.mean(
+                rmsd_matrix[np.ix_(
+                    np.where(clusters == cluster_id)[0],
+                    np.where(clusters == cluster_id)[0]
+                )][np.nonzero(rmsd_matrix[np.ix_(
+                    np.where(clusters == cluster_id)[0],
+                    np.where(clusters == cluster_id)[0]
+                )])]
+            ) for cluster_id in unique_clusters
+        }
 
         max_spread = max(cluster_spreads.values())
         normalized_spreads = {k: v/max_spread * 1000 for k, v in cluster_spreads.items()}
@@ -83,7 +89,7 @@ class ClusterVisualizer:
             centroid = np.mean(cluster_coords, axis=0)
 
             plt.scatter(centroid[0], centroid[1], s=normalized_spreads[cluster_id], c=[colors[i]], alpha=0.6, label=f'Cluster {cluster_id}')
-            plt.annotate(f'{cluster_id}', (centroid[0], centroid[1]), xytext=(5,5), textcoords='offset points')
+            plt.annotate(f'{cluster_id}', (centroid[0], centroid[1]), xytext=(5, 5), textcoords='offset points')
 
         plt.title(f'2D Distance Projection - Compound {compound_id}')
         plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
@@ -108,10 +114,53 @@ class ClusterVisualizer:
         plt.savefig(os.path.join(output_dir, f'compound_{compound_id}_distance_matrix.png'), dpi=dpi, bbox_inches='tight')
         plt.close()
 
-    def create_visualizations(self, rmsd_matrix, clusters, linkage, cutoff, compound_id, output_dir):
+    def plot_optimal_cluster_metrics(self, metrics: dict, output_dir: str, compound_id: str, optimal_clusters: int):
+        """Plot and save all optimal cluster count metrics in one figure with 4 subplots."""
+        x = range(2, 11)
+        fig, axs = plt.subplots(2, 2, figsize=(14, 10))
+
+        # Plot Elbow Method
+        axs[0, 0].plot(x, metrics['elbow'], 'kx-')
+        axs[0, 0].axvline(optimal_clusters, color='r', linestyle='--', label='Optimal Clusters')
+        axs[0, 0].set_title('Elbow Method For Optimal Clusters (Lower is better)')
+        axs[0, 0].set_xlabel('Number of clusters')
+        axs[0, 0].set_ylabel('Within-cluster Sum of Squares')
+        axs[0, 0].legend()
+
+        # Plot Silhouette Score
+        axs[0, 1].plot(x, metrics['silhouette'], 'kx-')
+        axs[0, 1].axvline(optimal_clusters, color='r', linestyle='--', label='Optimal Clusters')
+        axs[0, 1].set_title('Silhouette Score For Optimal Clusters (Higher is better)')
+        axs[0, 1].set_xlabel('Number of clusters')
+        axs[0, 1].set_ylabel('Silhouette Score')
+        axs[0, 1].legend()
+
+        # Plot Calinski-Harabasz Score
+        axs[1, 0].plot(x, metrics['calinski'], 'kx-')
+        axs[1, 0].axvline(optimal_clusters, color='r', linestyle='--', label='Optimal Clusters')
+        axs[1, 0].set_title('Calinski-Harabasz Score For Optimal Clusters (Higher is better)')
+        axs[1, 0].set_xlabel('Number of clusters')
+        axs[1, 0].set_ylabel('Calinski-Harabasz Score')
+        axs[1, 0].legend()
+
+        # Plot Davies-Bouldin Score
+        axs[1, 1].plot(x, metrics['davies'], 'kx-')
+        axs[1, 1].axvline(optimal_clusters, color='r', linestyle='--', label='Optimal Clusters')
+        axs[1, 1].set_title('Davies-Bouldin Score For Optimal Clusters (Lower is better)')
+        axs[1, 1].set_xlabel('Number of clusters')
+        axs[1, 1].set_ylabel('Davies-Bouldin Score')
+        axs[1, 1].legend()
+
+        plt.tight_layout()
+        plt.savefig(os.path.join(output_dir, f'{compound_id}_optimal_cluster_metrics.png'), dpi=300, bbox_inches='tight')
+        plt.close()
+
+    def create_visualizations(self, rmsd_matrix, clusters, linkage, compound_id, output_dir, metrics=None, optimal_clusters=None):
         os.makedirs(output_dir, exist_ok=True)
         colors = self.plot_dendrogram(linkage, clusters, output_dir, compound_id)
         self.plot_linear_projection(clusters, len(clusters), colors, output_dir, compound_id)
         self.plot_cluster_sizes(clusters, colors, output_dir, compound_id)
         self.plot_2d_projection(rmsd_matrix, clusters, colors, output_dir, compound_id)
         self.plot_distance_matrix(rmsd_matrix, output_dir, compound_id)
+        if metrics and optimal_clusters:
+            self.plot_optimal_cluster_metrics(metrics, output_dir, compound_id, optimal_clusters)

@@ -1,7 +1,7 @@
 from sklearn.cluster import KMeans
 import numpy as np
 from typing import List
-from ..strategies import ClusteringStrategy
+from src.conformacophore.strategies import ClusteringStrategy
 
 class KMeansClustering(ClusteringStrategy):
     def __init__(self, n_clusters: int):
