@@ -1,0 +1,44 @@
+Trajectory Conversion Summary
+==========================
+
+Source: test_data/300K_fit_4000.xtc
+Structure: test_data/md_Ref.gro
+Total frames: 4000 (stride: 1)
+Number of sequences: 7
+
+Sequences:
+
+UNK1:
+  Residue: UNK
+  Number of atoms: 14
+  Output file: UNK1.pdb
+
+UNK2:
+  Residue: UNK
+  Number of atoms: 16
+  Output file: UNK2.pdb
+
+UNK3:
+  Residue: UNK
+  Number of atoms: 19
+  Output file: UNK3.pdb
+
+UNK4:
+  Residue: UNK
+  Number of atoms: 19
+  Output file: UNK4.pdb
+
+UNK5:
+  Residue: UNK
+  Number of atoms: 14
+  Output file: UNK5.pdb
+
+UNK6:
+  Residue: UNK
+  Number of atoms: 19
+  Output file: UNK6.pdb
+
+UNK7:
+  Residue: UNK
+  Number of atoms: 20
+  Output file: UNK7.pdb

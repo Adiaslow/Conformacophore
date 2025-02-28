@@ -330,10 +330,11 @@ class TrajectoryConverter:
         """
         Convert an XTC trajectory file to multiple PDB files, one per sequence.
         Each PDB file will contain all frames for its sequence as separate models.
+        All output files are saved in a dedicated output directory.
 
         Args:
             xtc_path: Path to the input XTC file
-            output_path: Base path where the output PDB files should be saved
+            output_path: Base path for the output directory and files
             start: First frame to convert (0-based indexing)
             end: Last frame to convert (None means until the end)
             stride: Step size for frame selection
@@ -345,6 +346,15 @@ class TrajectoryConverter:
             raise ValueError(f"XTC file not found: {xtc_path}")
 
         try:
+            # Create output directory structure
+            output_dir = Path(output_path).resolve()
+            if output_dir.suffix:  # If output_path includes a file extension
+                output_dir = output_dir.parent / output_dir.stem
+
+            # Create the output directory
+            output_dir.mkdir(parents=True, exist_ok=True)
+            self.logger.info(f"Created output directory: {output_dir}")
+
             # Create universe from trajectory
             with warnings.catch_warnings():
                 warnings.filterwarnings("ignore", category=UserWarning)
@@ -360,112 +370,220 @@ class TrajectoryConverter:
             trajectory_slice = universe.trajectory[start:end:stride]
             total_frames = len(trajectory_slice)
 
-            # Get residue information and create sequence groups
-            sequence_groups = {}  # Dict to store atom indices for each sequence
+            # Get sequence information and create output files
+            sequence_groups = {}  # Dict to store sequence information
+
+            # Get the complete sequence of residue names
+            residue_sequence = []
             if hasattr(universe, "residues") and universe.residues is not None:
                 for residue in universe.residues:
                     resname = getattr(residue, "resname", "UNK")
-                    resid = getattr(residue, "resid", 1)
-                    sequence_key = f"{resname}{resid}"
-                    sequence_groups[sequence_key] = {
-                        "atoms": residue.atoms,
-                        "resname": resname,
-                        "resid": resid,
-                    }
-            else:
-                sequence_groups["UNK1"] = {
-                    "atoms": universe.atoms,
-                    "resname": "UNK",
-                    "resid": 1,
-                }
+                    residue_sequence.append(resname)
 
-            # Create output directory if needed
-            output_dir = os.path.dirname(output_path)
-            if output_dir:
-                os.makedirs(output_dir, exist_ok=True)
+            # Create a sequence identifier from the residue sequence
+            sequence_name = "_".join(residue_sequence) if residue_sequence else "UNK"
 
-            # Base name for output files
-            base_name = os.path.splitext(output_path)[0]
+            # Store all atoms as one sequence
+            sequence_groups[sequence_name] = {
+                "atoms": universe.atoms,
+                "residue_sequence": residue_sequence,
+                "compound_name": os.path.basename(
+                    self.topology_file or "unknown"
+                ).split(".")[0],
+            }
+
             output_files = []
 
-            # Process each sequence separately
-            for seq_name, seq_info in sequence_groups.items():
-                seq_atoms = seq_info["atoms"]
-                seq_output = f"{base_name}_{seq_name}.pdb"
+            # Create a summary file
+            summary_path = output_dir / "conversion_summary.txt"
+            with open(summary_path, "w") as summary:
+                summary.write("Trajectory Conversion Summary\n")
+                summary.write("==========================\n\n")
+                summary.write(f"Source: {xtc_path}\n")
+                summary.write(f"Structure: {self.topology_file or 'inferred'}\n")
+                summary.write(f"Total frames: {total_frames} (stride: {stride})\n")
+                summary.write(f"Sequences processed: {len(sequence_groups)}\n\n")
+                summary.write("Sequence Information:\n")
 
-                # Create a temporary universe for this sequence
-                temp_u = mda.Universe.empty(
-                    len(seq_atoms),
-                    n_residues=1,  # One residue per sequence
-                    atom_resindex=[0] * len(seq_atoms),
-                    trajectory=True,
-                )
+                # Process each sequence
+                for seq_name, seq_info in sequence_groups.items():
+                    seq_atoms = seq_info["atoms"]
+                    compound_name = seq_info["compound_name"]
+                    seq_output = output_dir / f"{compound_name}.pdb"
 
-                # Set atom attributes
-                names = (
-                    seq_atoms.names
-                    if hasattr(seq_atoms, "names")
-                    else [f"A{i+1}" for i in range(len(seq_atoms))]
-                )
-                elements = (
-                    seq_atoms.elements
-                    if hasattr(seq_atoms, "elements")
-                    else ["C"] * len(seq_atoms)
-                )
+                    # Add to summary
+                    summary.write(f"\n{compound_name}:\n")
+                    summary.write(
+                        f"  Residue sequence: {' - '.join(seq_info['residue_sequence'])}\n"
+                    )
+                    summary.write(f"  Number of atoms: {len(seq_atoms)}\n")
+                    summary.write(f"  Output file: {seq_output.name}\n")
 
-                # Set topology attributes
-                temp_u.add_TopologyAttr("names", names)
-                temp_u.add_TopologyAttr("elements", elements)
-                temp_u.add_TopologyAttr("resnames", [seq_info["resname"]])
-                temp_u.add_TopologyAttr("resids", [seq_info["resid"]])
-                temp_u.add_TopologyAttr("chainIDs", ["A"] * len(seq_atoms))
-                temp_u.add_TopologyAttr("occupancies", [1.0] * len(seq_atoms))
-                temp_u.add_TopologyAttr("tempfactors", [0.0] * len(seq_atoms))
-                temp_u.add_TopologyAttr("altLocs", [" "] * len(seq_atoms))
-                temp_u.add_TopologyAttr("segids", [""] * 1)  # One segment
+                    # Create a temporary universe for this sequence
+                    # First, get bond information if available
+                    bonds = []
+                    atom_indices = {}
+                    if hasattr(seq_atoms, "bonds"):
+                        # Convert bond indices to be relative to this sequence's atoms
+                        atom_indices = {
+                            old: new for new, old in enumerate(seq_atoms.indices)
+                        }
+                        for bond in seq_atoms.bonds:
+                            if all(atom.index in atom_indices for atom in bond.atoms):
+                                bonds.append(
+                                    [atom_indices[atom.index] for atom in bond.atoms]
+                                )
 
-                # Write trajectory for this sequence
-                with PDBWriter(seq_output, multiframe=True) as pdb_writer:
-                    # Write header information
-                    remark_lines = [
-                        f"REMARK   Generated by TrajectoryConverter",
-                        f"REMARK   Source: {xtc_path}",
-                        f"REMARK   Structure: {self.topology_file or 'inferred'}",
-                        f"REMARK   Sequence: {seq_name}",
-                        f"REMARK   Frames: {total_frames} (stride: {stride})",
-                    ]
+                    # Create the universe without bonds first
+                    temp_u = mda.Universe.empty(
+                        len(seq_atoms),
+                        n_residues=len(
+                            seq_info["residue_sequence"]
+                        ),  # Maintain original residue count
+                        atom_resindex=[
+                            atom.residue.resindex for atom in seq_atoms
+                        ],  # Keep original residue assignments
+                        trajectory=True,
+                    )
 
-                    with open(seq_output, "w") as f:
-                        f.write("\n".join(remark_lines) + "\n")
+                    # Set atom attributes
+                    names = (
+                        seq_atoms.names
+                        if hasattr(seq_atoms, "names")
+                        else [f"A{i+1}" for i in range(len(seq_atoms))]
+                    )
+                    elements = (
+                        seq_atoms.elements
+                        if hasattr(seq_atoms, "elements")
+                        else ["C"] * len(seq_atoms)
+                    )
 
-                    # Process frames
-                    for frame_num, ts in enumerate(
-                        tqdm(
-                            trajectory_slice,
-                            total=total_frames,
-                            desc=f"Converting {seq_name}",
-                            unit="frame",
-                        )
-                    ):
-                        # Update coordinates for this sequence
-                        temp_u.atoms.positions = seq_atoms.positions.copy()
+                    # Set topology attributes
+                    temp_u.add_TopologyAttr("names", names)
+                    temp_u.add_TopologyAttr("elements", elements)
+                    temp_u.add_TopologyAttr("resnames", seq_info["residue_sequence"])
+                    temp_u.add_TopologyAttr(
+                        "resids",
+                        [i + 1 for i in range(len(seq_info["residue_sequence"]))],
+                    )
+                    temp_u.add_TopologyAttr("chainIDs", ["A"] * len(seq_atoms))
+                    temp_u.add_TopologyAttr("occupancies", [1.0] * len(seq_atoms))
+                    temp_u.add_TopologyAttr("tempfactors", [0.0] * len(seq_atoms))
+                    temp_u.add_TopologyAttr("altLocs", [" "] * len(seq_atoms))
+                    temp_u.add_TopologyAttr(
+                        "segids", [""] * len(seq_info["residue_sequence"])
+                    )  # One segid per residue
 
-                        # Write frame-specific remarks
-                        frame_remarks = [
-                            f"REMARK   Frame: {frame_num}",
-                            f"REMARK   Time: {ts.time:.2f} ps",
+                    # Add bonds if we found any
+                    if bonds:
+                        temp_u.add_TopologyAttr("bonds", bonds)
+
+                        # Add bond orders if available
+                        if hasattr(seq_atoms, "bonds") and hasattr(
+                            seq_atoms.bonds, "order"
+                        ):
+                            bond_orders = []
+                            for bond in seq_atoms.bonds:
+                                if all(
+                                    atom.index in atom_indices for atom in bond.atoms
+                                ):
+                                    bond_orders.append(bond.order)
+                            if bond_orders:
+                                temp_u.add_TopologyAttr("bond_order", bond_orders)
+
+                        # Add any additional bond attributes that might be present
+                        bond_attributes = ["type", "value", "length"]
+                        for attr in bond_attributes:
+                            if hasattr(seq_atoms, "bonds") and hasattr(
+                                seq_atoms.bonds, attr
+                            ):
+                                values = []
+                                for bond in seq_atoms.bonds:
+                                    if all(
+                                        atom.index in atom_indices
+                                        for atom in bond.atoms
+                                    ):
+                                        values.append(getattr(bond, attr))
+                                if values:
+                                    temp_u.add_TopologyAttr(f"bond_{attr}", values)
+
+                    # Write trajectory for this sequence
+                    with PDBWriter(str(seq_output), multiframe=True) as pdb_writer:
+                        # Write header information
+                        remark_lines = [
+                            f"REMARK   Generated by TrajectoryConverter",
+                            f"REMARK   Source: {xtc_path}",
+                            f"REMARK   Structure: {self.topology_file or 'inferred'}",
+                            f"REMARK   Sequence: {seq_name}",
+                            f"REMARK   Frames: {total_frames} (stride: {stride})",
                         ]
-                        with open(seq_output, "a") as f:
-                            f.write("\n".join(frame_remarks) + "\n")
 
-                        # Write frame
-                        pdb_writer.write(temp_u)
+                        # Add connectivity information to remarks
+                        if bonds:
+                            remark_lines.extend(
+                                [
+                                    f"REMARK   Connectivity Information:",
+                                    f"REMARK   Number of bonds: {len(bonds)}",
+                                ]
+                            )
+                            # Add CONECT records
+                            for bond in bonds:
+                                remark_lines.append(
+                                    f"CONECT {bond[0]+1:4d} {bond[1]+1:4d}"
+                                )
 
-                output_files.append(Path(seq_output))
-                self.logger.info(
-                    f"Created PDB file for sequence {seq_name}: {seq_output}"
-                )
+                        with open(seq_output, "w") as f:
+                            f.write("\n".join(remark_lines) + "\n")
 
+                        # Process frames
+                        for frame_num, ts in enumerate(
+                            tqdm(
+                                trajectory_slice,
+                                total=total_frames,
+                                desc=f"Converting {seq_name}",
+                                unit="frame",
+                            )
+                        ):
+                            # Validate universe and atoms before position assignment
+                            if (
+                                not temp_u
+                                or not temp_u.atoms
+                                or not hasattr(temp_u.atoms, "positions")
+                            ):
+                                raise ValueError(
+                                    "Invalid temporary universe or missing positions attribute"
+                                )
+
+                            if not seq_atoms or not hasattr(seq_atoms, "positions"):
+                                raise ValueError(
+                                    "Invalid sequence atoms or missing positions"
+                                )
+
+                            try:
+                                # Update coordinates for this sequence
+                                temp_u.atoms.positions = seq_atoms.positions.copy()
+                            except Exception as e:
+                                raise ValueError(
+                                    f"Failed to update coordinates for frame {frame_num}: {str(e)}"
+                                )
+
+                            # Write frame-specific remarks
+                            frame_remarks = [
+                                f"REMARK   Frame: {frame_num}",
+                                f"REMARK   Time: {ts.time:.2f} ps",
+                            ]
+                            with open(seq_output, "a") as f:
+                                f.write("\n".join(frame_remarks) + "\n")
+
+                            # Write frame
+                            pdb_writer.write(temp_u)
+
+                    output_files.append(seq_output)
+                    self.logger.info(
+                        f"Created PDB file for sequence {seq_name}: {seq_output}"
+                    )
+
+            self.logger.info(f"Conversion summary written to: {summary_path}")
             return output_files
 
         except Exception as e:
