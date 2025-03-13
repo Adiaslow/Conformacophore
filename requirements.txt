@@ -1,0 +1,12 @@
+# Core dependencies
+MDAnalysis>=2.0.0  # For molecular dynamics trajectory handling
+numpy>=1.21.0      # Required by MDAnalysis
+tqdm>=4.65.0      # For progress bars
+
+# Development dependencies
+black>=23.0.0      # Code formatting
+isort>=5.12.0      # Import sorting
+pylint>=2.17.0     # Code linting
+mypy>=1.0.0        # Type checking
+pytest>=7.0.0      # Testing framework
+pytest-cov>=4.0.0  # Test coverage reporting 
