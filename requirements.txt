@@ -1,7 +1,13 @@
 # Core dependencies
 MDAnalysis>=2.0.0  # For molecular dynamics trajectory handling
 numpy>=1.21.0      # Required by MDAnalysis
-tqdm>=4.65.0      # For progress bars
+pandas>=2.0.0      # For data analysis and CSV handling
+networkx>=3.0      # For molecular graph operations
+scipy>=1.10.0      # For scientific computations
+scikit-learn>=1.0.0  # For clustering
+mdtraj>=1.9.0      # For trajectory analysis
+tqdm>=4.65.0       # For progress bars
+biopython>=1.81    # For PDB file handling
 
 # Development dependencies
 black>=23.0.0      # Code formatting

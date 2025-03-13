@@ -14,6 +14,7 @@ from typing import Optional, Dict, Any, List, Tuple, NamedTuple, Sequence
 from dataclasses import dataclass
 import functools
 import tempfile
+import shutil
 
 # Third party imports
 import MDAnalysis as mda
@@ -61,6 +62,7 @@ class TrajectoryConverter:
         topology_file: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
         top_file: Optional[str] = None,
+        verbose: bool = False,
     ):
         """
         Initialize the TrajectoryConverter.
@@ -71,21 +73,37 @@ class TrajectoryConverter:
             metadata: Optional dictionary containing default metadata for PDB writing
                      Possible keys: resnames, chainIDs, resids, names, elements
             top_file: Optional path to a GROMACS topology (.top) file
+            verbose: Whether to show detailed logging output
         """
         self.topology_file = topology_file
         self.metadata = metadata or {}
         self.top_file = top_file
+        self.verbose = verbose
         self.logger = self._setup_logging()
 
     def _setup_logging(self) -> logging.Logger:
         """Set up logging for the converter"""
         logger = logging.getLogger(__name__)
-        if not logger.handlers:
-            handler = logging.StreamHandler()
-            formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
-            handler.setFormatter(formatter)
-            logger.addHandler(handler)
-            logger.setLevel(logging.INFO)
+
+        # Remove any existing handlers
+        for handler in logger.handlers[:]:
+            logger.removeHandler(handler)
+
+        # Set up file handler for all logs
+        log_file = Path("trajectory_conversion.log")
+        file_handler = logging.FileHandler(log_file)
+        file_handler.setFormatter(
+            logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
+        )
+        logger.addHandler(file_handler)
+
+        # Only log to console if verbose is True
+        if self.verbose:
+            console_handler = logging.StreamHandler()
+            console_handler.setFormatter(logging.Formatter("%(message)s"))
+            logger.addHandler(console_handler)
+
+        logger.setLevel(logging.INFO)
         return logger
 
     def _find_topology_files(
@@ -108,14 +126,16 @@ class TrajectoryConverter:
         for ext in [".gro", ".pdb", ".tpr"]:
             potential_top = base_path + ext
             if os.path.exists(potential_top):
-                self.logger.info(f"Found structure file: {potential_top}")
+                if self.verbose:
+                    self.logger.info(f"Found structure file: {potential_top}")
                 struct_file = potential_top
                 break
 
         # Look for topology file
         top_file = os.path.join(base_dir, "topol.top")
         if os.path.exists(top_file):
-            self.logger.info(f"Found topology file: {top_file}")
+            if self.verbose:
+                self.logger.info(f"Found topology file: {top_file}")
             return struct_file, top_file
 
         return struct_file, None
@@ -477,163 +497,43 @@ class TrajectoryConverter:
         except Exception as e:
             self.logger.warning(f"Error applying metadata: {str(e)}")
 
-    def xtc_to_multimodel_pdb(
-        self,
-        xtc_path: str,
-        output_path: str,
-        start: int = 0,
-        end: Optional[int] = None,
-        stride: int = 1,
-    ) -> List[Path]:
-        """
-        Convert XTC trajectory to multi-model PDB files.
+    def _copy_to_local(self, file_path: str) -> Path:
+        """Copy a file to a local temporary directory."""
+        # Create temporary directory in user's home
+        temp_dir = Path.home() / ".mdanalysis_temp"
+        temp_dir.mkdir(exist_ok=True)
 
-        Args:
-            xtc_path: Path to XTC file
-            output_path: Path for output PDB file
-            start: First frame to convert (0-based)
-            end: Last frame to convert (None = all frames)
-            stride: Step size for frame selection
+        # Create a unique subdirectory for this process
+        process_dir = temp_dir / f"process_{os.getpid()}"
+        process_dir.mkdir(exist_ok=True)
 
-        Returns:
-            List[Path]: List of output PDB files
+        # Copy file to temporary location
+        src_path = Path(file_path)
+        temp_path = process_dir / src_path.name
 
-        Raises:
-            ValueError: If conversion fails
-        """
-        try:
-            # Create output directory structure
-            output_dir = Path(output_path).resolve()
-            if output_dir.suffix:  # If output_path includes a file extension
-                output_dir = output_dir.parent / output_dir.stem
+        with open(src_path, "rb") as src, open(temp_path, "wb") as dst:
+            shutil.copyfileobj(src, dst)
 
-            # Create the output directory
-            output_dir.mkdir(parents=True, exist_ok=True)
-            self.logger.info(f"Created output directory: {output_dir}")
-
-            # Create universe from trajectory
-            with warnings.catch_warnings():
-                warnings.filterwarnings("ignore", category=UserWarning)
-                universe = self._create_universe(xtc_path)
-
-            if not universe or not universe.atoms:
-                raise ValueError("Could not create universe from trajectory")
-
-            # Get metadata including residue sequence from topology file
-            top_metadata = self._parse_top_file()
-
-            # Apply metadata to universe
-            self._apply_metadata(universe)
-
-            # Calculate total frames to process
-            trajectory_slice = universe.trajectory[start:end:stride]
-            total_frames = len(trajectory_slice)
-
-            # Create output file path
-            output_file = output_dir / "md_Ref.pdb"
-
-            # Write PDB file
-            with open(output_file, "w") as f:
-                # Write header
-                f.write("TITLE     TRAJECTORY CONVERTED FROM XTC\n")
-                f.write(f"REMARK   1 SOURCE: {os.path.basename(xtc_path)}\n")
-                f.write(
-                    f"REMARK   2 STRUCTURE: {os.path.basename(self.topology_file or 'inferred')}\n"
-                )
-                f.write(f"REMARK   3 FRAMES: {total_frames}\n")
-                f.write(f"REMARK   4 ATOMS: {len(universe.atoms)}\n")
-
-                # Write SEQRES records
-                residue_sequence = top_metadata.get("residue_sequence", ["UNK"])
-                num_residues = len(residue_sequence)
-                # Split sequence into chunks of 13 (PDB format requirement)
-                for i in range(0, num_residues, 13):
-                    chunk = residue_sequence[i : i + 13]
-                    # Format: SEQRES  1 A  13  residue names...
-                    f.write(
-                        f"SEQRES  {i//13 + 1:2d} A {num_residues:4d}  {' '.join(f'{res:3s}' for res in chunk)}\n"
-                    )
-
-                f.write(
-                    "CRYST1    0.000    0.000    0.000  90.00  90.00  90.00 P 1           1\n"
-                )
-
-                # Get bond information from topology file
-                bonds = top_metadata.get("bonds", [])
-                if bonds:
-                    self.logger.info(f"Found {len(bonds)} bonds in topology file")
-                else:
-                    self.logger.warning("No bonds found in topology file")
-
-                # Process frames
-                for frame_num, ts in enumerate(
-                    tqdm(
-                        trajectory_slice,
-                        total=total_frames,
-                        desc="Converting frames",
-                        unit="frame",
-                    )
-                ):
-                    # Write MODEL record
-                    f.write(f"MODEL{frame_num + 1:9d}\n")
-
-                    # Write coordinates using PDB format
-                    for atom in universe.atoms:
-                        # Get atom attributes safely
-                        name = getattr(atom, "name", f"A{atom.id}")[:4]
-                        resname = getattr(atom, "resname", "UNK")[:3]
-                        chainID = getattr(atom, "chainID", "A")
-                        resid = getattr(atom, "resid", 1)
-                        x, y, z = atom.position
-
-                        # Write ATOM record
-                        f.write(
-                            f"ATOM  {atom.id:5d} {name:<4s}{resname:>3s} {chainID}{resid:4d}    "
-                            f"{x:8.3f}{y:8.3f}{z:8.3f}  1.00  0.00\n"
-                        )
-
-                    # Write CONECT records from topology file bonds
-                    if bonds:
-                        # Create a set to track written bonds to avoid duplicates
-                        written_bonds = set()
-                        for bond in bonds:
-                            # Convert from 0-based to 1-based indexing for PDB format
-                            atom1 = bond[0] + 1
-                            atom2 = bond[1] + 1
-                            # Create a sorted tuple to identify unique bonds
-                            bond_key = tuple(sorted([atom1, atom2]))
-                            if bond_key not in written_bonds:
-                                f.write(f"CONECT{atom1:5d}{atom2:5d}\n")
-                                written_bonds.add(bond_key)
-
-                    # Write ENDMDL
-                    f.write("ENDMDL\n")
-
-                # Write END record
-                f.write("END\n")
-
-            return [output_file]
-
-        except Exception as e:
-            raise ValueError(f"Failed to convert trajectory: {str(e)}")
+        return temp_path
 
     def get_trajectory_info(self, xtc_path: str) -> dict:
-        """
-        Get information about a trajectory file.
-
-        Args:
-            xtc_path: Path to the XTC file
-
-        Returns:
-            dict: Dictionary containing trajectory information
-        """
+        """Get information about a trajectory file."""
         if not os.path.exists(xtc_path):
             raise ValueError(f"XTC file not found: {xtc_path}")
 
         try:
+            # Copy files to local storage
+            local_xtc = self._copy_to_local(xtc_path)
+            local_top = (
+                self._copy_to_local(self.topology_file) if self.topology_file else None
+            )
+
             with warnings.catch_warnings():
                 warnings.filterwarnings("ignore", category=UserWarning)
-                universe = self._create_universe(xtc_path)
+                if local_top:
+                    universe = mda.Universe(str(local_top), str(local_xtc))
+                else:
+                    universe = mda.Universe(str(local_xtc))
 
             if not universe or not universe.atoms:
                 raise ValueError("Could not create universe from trajectory")
@@ -668,3 +568,79 @@ class TrajectoryConverter:
             }
         except Exception as e:
             raise ValueError(f"Failed to get trajectory info: {str(e)}")
+        finally:
+            # Clean up temporary files
+            if "local_xtc" in locals():
+                try:
+                    local_xtc.unlink()
+                except:
+                    pass
+            if "local_top" in locals() and local_top:
+                try:
+                    local_top.unlink()
+                except:
+                    pass
+
+    def xtc_to_multimodel_pdb(
+        self,
+        xtc_file: str,
+        output_dir: str,
+        start: int = 0,
+        end: Optional[int] = None,
+        stride: int = 1,
+    ) -> None:
+        """Convert XTC trajectory to multi-model PDB."""
+        # Disable all MDAnalysis warnings
+        warnings.filterwarnings("ignore", category=UserWarning)
+        warnings.filterwarnings("ignore", category=RuntimeWarning)
+
+        try:
+            # Copy files to local storage
+            local_xtc = self._copy_to_local(xtc_file)
+            local_top = self._copy_to_local(self.topology_file)
+
+            # Create Universe using local copies
+            u = mda.Universe(str(local_top), str(local_xtc))
+
+            # Get the output path
+            output_path = Path(output_dir) / "md_Ref.pdb"
+
+            # Create a context manager for the progress bar
+            total_frames = len(
+                range(start, len(u.trajectory) if end is None else end, stride)
+            )
+
+            # Use tqdm only if this is not a child process and not quiet mode
+            is_main_process = not bool(os.getenv("PARALLEL_WORKER"))
+            is_quiet = not self.verbose or bool(os.getenv("QUIET"))
+
+            with tqdm(
+                total=total_frames,
+                desc="Converting frames",
+                disable=not is_main_process or is_quiet,
+                leave=False,
+                position=1,
+                ncols=80,
+            ) as pbar:
+                # Process frames
+                with PDBWriter(str(output_path)) as pdb:
+                    for ts in u.trajectory[start:end:stride]:
+                        pdb.write(u.atoms)
+                        pbar.update(1)
+
+        except Exception as e:
+            if self.verbose:
+                self.logger.error(f"Error converting trajectory {xtc_file}: {str(e)}")
+            raise
+        finally:
+            # Clean up temporary files
+            if "local_xtc" in locals():
+                try:
+                    local_xtc.unlink()
+                except:
+                    pass
+            if "local_top" in locals():
+                try:
+                    local_top.unlink()
+                except:
+                    pass

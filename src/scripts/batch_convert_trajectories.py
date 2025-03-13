@@ -13,10 +13,11 @@ import argparse
 import logging
 import json
 from pathlib import Path
-from typing import Optional, Dict, List, Set
-from concurrent.futures import ProcessPoolExecutor
+from typing import Optional, Dict, List, Set, Tuple
+from concurrent.futures import ProcessPoolExecutor, as_completed
 import time
-from tqdm import tqdm
+from tqdm.auto import tqdm
+import datetime
 
 from src.core.services.trajectory_converter import TrajectoryConverter
 
@@ -60,205 +61,293 @@ def copy_to_temp(file_path: str) -> tuple[Path, Path]:
     return src_path, temp_path
 
 
-def process_trajectory(args: Dict) -> Dict:
-    """Process a single trajectory with local caching and error handling."""
-    xtc_path = args["xtc_path"]
-    gro_path = args["gro_path"]
-    top_path = args.get("top_path")
-    output_dir = args["output_dir"]
-    max_retries = args.get("max_retries", 3)
-    retry_delay = args.get("retry_delay", 1.0)
+def is_already_processed(output_dir: Path, xtc_path: str) -> bool:
+    """
+    Check if the trajectory has already been processed successfully.
 
-    logger = setup_logging()
-    result = {"success": False, "xtc_path": xtc_path, "error": None}
+    Args:
+        output_dir: Directory containing output files
+        xtc_path: Path to the input XTC file
+
+    Returns:
+        bool: True if both PDB and summary files exist and are valid
+    """
+    pdb_file = output_dir / "md_Ref.pdb"
+    summary_file = output_dir / "conversion_summary.json"
+
+    # Check if both files exist
+    if not (pdb_file.exists() and summary_file.exists()):
+        return False
 
     try:
-        # Copy files to temporary directory
-        logger.info(f"Copying files to temporary directory for {xtc_path}...")
-        _, temp_xtc = copy_to_temp(xtc_path)
-        _, temp_gro = copy_to_temp(gro_path)
-        temp_top = None
-        if top_path:
-            _, temp_top = copy_to_temp(top_path)
+        # Check if summary file is valid and matches current input
+        with open(summary_file, "r") as f:
+            summary = json.load(f)
 
-        temp_dir = temp_xtc.parent
-        logger.info(f"Using temporary directory: {temp_dir}")
+        # Verify summary contains expected information
+        if not all(
+            key in summary for key in ["input_xtc", "timestamp", "n_frames", "n_atoms"]
+        ):
+            return False
 
-        # Create a temporary output directory for local writing
-        with tempfile.TemporaryDirectory(prefix="traj_output_") as temp_output_dir:
-            temp_output_path = Path(temp_output_dir)
-            logger.info(f"Using temporary output directory: {temp_output_path}")
+        # Check if the summary matches the current input file
+        if summary["input_xtc"] != str(xtc_path):
+            return False
 
-            # Initialize converter with temporary files
-            converter = TrajectoryConverter(
-                topology_file=str(temp_gro),
-                top_file=str(temp_top) if temp_top else None,
-            )
+        # Optionally, verify PDB file size is non-zero
+        if pdb_file.stat().st_size == 0:
+            return False
+
+        return True
+
+    except (json.JSONDecodeError, KeyError, OSError):
+        return False
+
+
+def write_conversion_summary(
+    output_dir: Path,
+    xtc_path: str,
+    n_frames: int,
+    n_atoms: int,
+    residue_sequence: List[str],
+) -> None:
+    """
+    Write a summary of the conversion process.
+
+    Args:
+        output_dir: Directory to write summary file
+        xtc_path: Path to input XTC file
+        n_frames: Number of frames processed
+        n_atoms: Number of atoms
+        residue_sequence: List of residue names
+    """
+    summary = {
+        "input_xtc": str(xtc_path),
+        "timestamp": datetime.datetime.now().isoformat(),
+        "n_frames": n_frames,
+        "n_atoms": n_atoms,
+        "residue_sequence": residue_sequence,
+        "conversion_version": "1.0",  # Add version to track format changes
+    }
+
+    summary_file = output_dir / "conversion_summary.json"
+    with open(summary_file, "w") as f:
+        json.dump(summary, f, indent=2)
+
+
+def create_temp_dir() -> Path:
+    """Create a temporary directory in the user's home directory."""
+    home = Path.home()
+    temp_base = home / ".traj_convert_temp"
+    temp_base.mkdir(exist_ok=True)
+    temp_dir = temp_base / f"traj_{time.time_ns()}"
+    temp_dir.mkdir(parents=True)
+    return temp_dir
+
+
+def process_trajectory(args: Tuple[str, str, str, str, bool]) -> Optional[str]:
+    """Process a single trajectory file."""
+    xtc_path, topology_path, top_path, output_base, verbose = args
+
+    # Skip macOS hidden files
+    if os.path.basename(xtc_path).startswith("._"):
+        return None
+
+    try:
+        # Create output directory path and ensure it exists
+        output_dir = Path(output_base) / Path(xtc_path).parent.name
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        # Check if already processed
+        if is_already_processed(output_dir, xtc_path):
+            return None
+
+        # Use a context manager for temporary directory
+        with tempfile.TemporaryDirectory(prefix="traj_convert_") as temp_dir_str:
+            temp_dir = Path(temp_dir_str)
 
             try:
-                # Get trajectory info
-                logger.info("Getting trajectory information...")
-                info = converter.get_trajectory_info(str(temp_xtc))
-                logger.info(
-                    f"Found {info.get('n_frames', 0)} frames, {info.get('n_atoms', 0)} atoms"
+                # Copy input files to temporary directory
+                temp_xtc = temp_dir / Path(xtc_path).name
+                temp_top = temp_dir / Path(topology_path).name
+                temp_topol = temp_dir / Path(top_path).name
+
+                # Use chunks to copy large files
+                def copy_in_chunks(
+                    src_path: str, dst_path: Path, chunk_size: int = 1024 * 1024
+                ):
+                    with open(src_path, "rb") as fsrc:
+                        with open(dst_path, "wb") as fdst:
+                            while True:
+                                chunk = fsrc.read(chunk_size)
+                                if not chunk:
+                                    break
+                                fdst.write(chunk)
+                                fdst.flush()
+                                os.fsync(fdst.fileno())
+
+                # Copy files with chunking
+                copy_in_chunks(xtc_path, temp_xtc)
+                copy_in_chunks(topology_path, temp_top)
+                copy_in_chunks(top_path, temp_topol)
+
+                # Initialize converter with verbose flag
+                converter = TrajectoryConverter(
+                    topology_file=str(temp_top),
+                    top_file=str(temp_topol),
+                    verbose=verbose,
+                )
+
+                # Get trajectory information first
+                traj_info = converter.get_trajectory_info(str(temp_xtc))
+                n_frames = traj_info.get("n_frames", 0)
+                n_atoms = traj_info.get("n_atoms", 0)
+                residue_sequence = traj_info.get("residue_sequence", ["UNK"])
+
+                # Write initial conversion summary
+                write_conversion_summary(
+                    output_dir,
+                    xtc_path,
+                    n_frames=n_frames,
+                    n_atoms=n_atoms,
+                    residue_sequence=residue_sequence,
                 )
 
                 # Convert trajectory
-                logger.info("Converting trajectory...")
-                output_files = converter.xtc_to_multimodel_pdb(
-                    xtc_path=str(temp_xtc),
-                    output_path=str(temp_output_path),
+                converter.xtc_to_multimodel_pdb(
+                    str(temp_xtc), str(output_dir), start=0, end=None, stride=1
                 )
 
-                # Create output directory
-                output_path = Path(output_dir)
-                output_path.mkdir(parents=True, exist_ok=True)
-
-                # Copy output files to final destination
-                logger.info("Copying output files to final destination...")
-                for temp_file in output_files:
-                    dest_file = output_path / temp_file.name
-                    try:
-                        # Read source file in binary mode and write to destination
-                        with open(temp_file, "rb") as src, open(dest_file, "wb") as dst:
-                            dst.write(src.read())
-                        logger.info(f"  - Successfully copied {dest_file}")
-                    except Exception as e:
-                        logger.error(
-                            f"Error copying {temp_file} to {dest_file}: {str(e)}"
-                        )
-                        raise
-
-                result["success"] = True
+                return None
 
             except Exception as e:
-                result["error"] = str(e)
-                logger.error(f"Error converting trajectory: {str(e)}")
-
-        # Clean up temporary directory
-        logger.info("Cleaning up temporary files...")
-        shutil.rmtree(temp_dir, ignore_errors=True)
+                # Clean up partial output on error
+                try:
+                    if output_dir.exists():
+                        for file in output_dir.glob("*"):
+                            file.unlink()
+                        output_dir.rmdir()
+                except:
+                    pass
+                return f"Error processing {xtc_path}: {str(e)}"
 
     except Exception as e:
-        result["error"] = str(e)
-        logger.error(f"Error during file processing: {str(e)}")
-
-    return result
+        return f"Error processing {xtc_path}: {str(e)}"
 
 
 def main():
-    """Main function to convert trajectories."""
-    logger = setup_logging()
-
+    """Main function for batch converting trajectories."""
     parser = argparse.ArgumentParser(
-        description="Convert molecular dynamics trajectories"
+        description="Batch convert XTC trajectories to PDB"
     )
     parser.add_argument(
-        "root_dir", type=str, help="Root directory containing trajectory files"
-    )
-    parser.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="Only show what would be processed without converting",
+        "base_dir", type=str, help="Base directory containing trajectory files"
     )
     parser.add_argument(
         "--num-processes",
         type=int,
-        default=4,  # Reduced default to minimize contention
-        help="Number of parallel processes to use for conversion",
+        default=4,
+        help="Number of parallel processes to use",
     )
     parser.add_argument(
-        "--max-retries",
-        type=int,
-        default=3,
-        help="Maximum number of retries for failed operations",
+        "--force",
+        action="store_true",
+        help="Force reprocessing of already converted trajectories",
     )
     parser.add_argument(
-        "--retry-delay",
-        type=float,
-        default=1.0,
-        help="Delay between retries in seconds",
+        "--quiet", action="store_true", help="Suppress non-essential output"
     )
     parser.add_argument(
-        "--resume", action="store_true", help="Resume from last successful conversion"
+        "--verbose", action="store_true", help="Show detailed processing information"
     )
 
     args = parser.parse_args()
 
-    # Set up progress tracking
-    progress_file = Path(args.root_dir) / ".conversion_progress.json"
-    processed_trajectories = load_progress(progress_file) if args.resume else set()
+    # Configure logging to file
+    log_file = Path("trajectory_conversion.log")
 
-    try:
-        # Find all trajectory sets
-        logger.info(f"Scanning for trajectory sets...")
+    # Remove any existing handlers from root logger
+    root_logger = logging.getLogger()
+    for handler in root_logger.handlers[:]:
+        root_logger.removeHandler(handler)
 
-        trajectory_sets = []
-        for root, _, files in os.walk(args.root_dir):
-            if "300K_fit_4000.xtc" in files:
-                xtc_path = os.path.join(root, "300K_fit_4000.xtc")
-                gro_path = os.path.join(root, "md_Ref.gro")
-                top_path = os.path.join(root, "topol.top")
+    # Configure file logging
+    file_handler = logging.FileHandler(log_file)
+    file_handler.setFormatter(
+        logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
+    )
+    root_logger.addHandler(file_handler)
 
-                if os.path.exists(gro_path):
-                    if xtc_path not in processed_trajectories:
-                        trajectory_sets.append(
-                            {
-                                "xtc_path": xtc_path,
-                                "gro_path": gro_path,
-                                "top_path": (
-                                    top_path if os.path.exists(top_path) else None
-                                ),
-                                "output_dir": os.path.join(root + "_xtc_to_pdb"),
-                                "max_retries": args.max_retries,
-                                "retry_delay": args.retry_delay,
-                            }
-                        )
+    # Set logging level based on verbose flag
+    root_logger.setLevel(logging.INFO if args.verbose else logging.ERROR)
 
-        logger.info(f"Found {len(trajectory_sets)} trajectory sets to process")
+    # Set environment variable for child processes
+    if args.quiet:
+        os.environ["QUIET"] = "1"
+    if args.verbose:
+        os.environ["VERBOSE"] = "1"
 
-        if args.dry_run:
-            logger.info("Dry run - would process:")
-            for ts in trajectory_sets:
-                logger.info(f"  {ts['xtc_path']} -> {ts['output_dir']}")
-            return
+    # Find all trajectory sets
+    trajectory_sets = []
+    base_dir = Path(args.base_dir)
 
+    print("Scanning for trajectory files...")
+    for xtc_file in base_dir.rglob("*.xtc"):
+        # Skip macOS hidden files
+        if xtc_file.name.startswith("._"):
+            continue
+
+        gro_file = xtc_file.parent / "md_Ref.gro"
+        top_file = xtc_file.parent / "topol.top"
+
+        if gro_file.exists() and top_file.exists():
+            trajectory_sets.append(
+                (
+                    str(xtc_file),
+                    str(gro_file),
+                    str(top_file),
+                    str(base_dir),
+                    args.verbose,
+                )
+            )
+
+    if not trajectory_sets:
+        print(f"No valid trajectory sets found in {base_dir}")
+        return
+
+    total = len(trajectory_sets)
+    print(f"Found {total} trajectory sets to process")
+
+    # Initialize progress bar
+    with tqdm(
+        total=total,
+        desc="Converting trajectories",
+        unit="traj",
+        disable=args.quiet,
+        ncols=100,
+        bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]",
+    ) as pbar:
         # Process trajectories in parallel
-        num_processes = min(args.num_processes, os.cpu_count() or 1)
-        logger.info(f"Using {num_processes} processes for conversion")
-
-        with ProcessPoolExecutor(max_workers=num_processes) as executor:
+        with ProcessPoolExecutor(max_workers=args.num_processes) as executor:
             futures = []
-            for ts in trajectory_sets:
-                futures.append(executor.submit(process_trajectory, ts))
+            for traj_set in trajectory_sets:
+                if not args.force and is_already_processed(
+                    Path(traj_set[3]) / Path(traj_set[0]).parent.name, traj_set[0]
+                ):
+                    pbar.update(1)
+                    continue
+                futures.append(executor.submit(process_trajectory, traj_set))
 
-            # Track progress with tqdm
-            successful = 0
-            failed = 0
-            for future in tqdm(
-                futures, total=len(futures), desc="Converting trajectories"
-            ):
-                result = future.result()
-                if result["success"]:
-                    successful += 1
-                    processed_trajectories.add(result["xtc_path"])
-                    # Save progress periodically
-                    if successful % 10 == 0:
-                        save_progress(progress_file, processed_trajectories)
-                else:
-                    failed += 1
-                    logger.error(
-                        f"Failed to process {result['xtc_path']}: {result['error']}"
-                    )
+            # Process results as they complete
+            errors = []
+            for future in as_completed(futures):
+                error = future.result()
+                if error:
+                    errors.append(error)
+                pbar.update(1)
 
-        # Save final progress
-        save_progress(progress_file, processed_trajectories)
-
-        logger.info(f"Conversion complete. Successful: {successful}, Failed: {failed}")
-
-    except Exception as e:
-        logger.error(f"Error during batch processing: {str(e)}")
-        raise
+    if errors:
+        print(f"\nCompleted with {len(errors)} errors. See {log_file} for details.")
 
 
 if __name__ == "__main__":
