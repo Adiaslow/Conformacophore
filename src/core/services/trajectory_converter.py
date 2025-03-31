@@ -3,7 +3,7 @@
 
 """
 Service for converting molecular dynamics trajectories between different formats.
-Primarily focused on converting XTC trajectories to multi-model PDB files.
+Supports both MDAnalysis and GROMACS-based conversion methods.
 """
 # Standard library imports
 import os
@@ -15,11 +15,15 @@ from dataclasses import dataclass
 import functools
 import tempfile
 import shutil
+import subprocess
+import json
+import datetime
 
 # Third party imports
 import MDAnalysis as mda
 from tqdm import tqdm
 from MDAnalysis.coordinates.PDB import PDBWriter
+import numpy as np
 
 # Set up warning filter to ignore specific warning
 warnings.filterwarnings(
@@ -54,42 +58,129 @@ class MoleculeMetadata:
         )
 
 
-class TrajectoryConverter:
-    """Service class for converting between different trajectory formats."""
+class CustomPDBWriter:
+    """Custom PDB writer that formats output according to specifications."""
 
-    def __init__(
-        self,
-        topology_file: Optional[str] = None,
-        metadata: Optional[Dict[str, Any]] = None,
-        top_file: Optional[str] = None,
-        verbose: bool = False,
-    ):
-        """
-        Initialize the TrajectoryConverter.
+    def __init__(self, filename: str):
+        """Initialize the writer with output file path."""
+        self.filename = filename
+        self.model_number = 1
+        self._file = None
+
+    def __enter__(self):
+        """Context manager entry."""
+        self._file = open(self.filename, "w")
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        """Context manager exit."""
+        if self._file:
+            self._file.close()
+
+    def _write_atom_line(self, atom, coords) -> str:
+        """Format a single atom line according to PDB specifications."""
+        # Get the element from the atom name (first character)
+        element = atom.name[0] if atom.name else ""
+
+        return (
+            f"ATOM  {atom.id:5d} {atom.name:<4s} {atom.resname:3s} X{atom.resid:4d}"
+            f"    {coords[0]:8.3f}{coords[1]:8.3f}{coords[2]:8.3f}"
+            f"  1.00  0.00      {element:>1s}   \n"
+        )
+
+    def _write_conect_records(self, universe):
+        """Write CONECT records for bonds in the universe.
 
         Args:
-            topology_file: Optional path to a topology file (e.g., GRO, PDB)
-                         If not provided, will attempt to infer topology from trajectory
-            metadata: Optional dictionary containing default metadata for PDB writing
-                     Possible keys: resnames, chainIDs, resids, names, elements
-            top_file: Optional path to a GROMACS topology (.top) file
-            verbose: Whether to show detailed logging output
+            universe (MDAnalysis.Universe): Universe containing bond information
+
+        Returns:
+            List[str]: List of CONECT record strings
         """
-        self.topology_file = topology_file
-        self.metadata = metadata or {}
-        self.top_file = top_file
+        conect_records = []
+        if not hasattr(universe, "bonds") or len(universe.bonds) == 0:
+            if self.verbose:
+                self.logger.warning("No bonds found in universe")
+            return conect_records
+
+        # Create a dictionary to store all bonds for each atom
+        bond_dict = {}
+        for bond in universe.bonds:
+            # Convert back to 1-based indexing for PDB format
+            atom1 = bond.atoms[0].ix + 1
+            atom2 = bond.atoms[1].ix + 1
+
+            # Add bond to both atoms' lists
+            if atom1 not in bond_dict:
+                bond_dict[atom1] = []
+            if atom2 not in bond_dict:
+                bond_dict[atom2] = []
+            bond_dict[atom1].append(atom2)
+            bond_dict[atom2].append(atom1)
+
+        # Write CONECT records
+        for atom_idx in sorted(bond_dict.keys()):
+            # Sort bonded atoms for consistency
+            bonded_atoms = sorted(bond_dict[atom_idx])
+            # Format according to PDB standard (leading spaces important)
+            record = f"CONECT{atom_idx:5d}"
+            for bonded_atom in bonded_atoms:
+                record += f"{bonded_atom:5d}"
+            conect_records.append(record + "\n")
+
+        if self.verbose:
+            self.logger.info(f"Generated {len(conect_records)} CONECT records")
+
+        return conect_records
+
+    def write(self, universe, frame_number: int = 0, compound_number: int = 943):
+        """Write a single frame/model to the PDB file."""
+        # Write MODEL header
+        self._file.write(f"MODEL {self.model_number}\n")
+        self._file.write(f"COMPND {compound_number}\n")
+        self._file.write(f"REMARK Frame {frame_number}\n")
+
+        # Write SEQRES record
+        if hasattr(universe, "residues") and len(universe.residues) > 0:
+            residues = [res.resname for res in universe.residues]
+            self._file.write(f"SEQRES   1 A {len(residues):4d}  {' '.join(residues)}\n")
+
+        # Write atom records
+        for atom in universe.atoms:
+            self._file.write(self._write_atom_line(atom, atom.position))
+
+        # Write connectivity records
+        for conect_line in self._write_conect_records(universe):
+            self._file.write(conect_line)
+
+        # Write model end
+        self._file.write("END\n")
+        self._file.write("ENDMDL\n")
+        self.model_number += 1
+
+
+class GromacsPDBConverter:
+    """Handles trajectory conversion using GROMACS commands."""
+
+    def __init__(self, verbose: bool = False):
+        """Initialize the converter.
+
+        Args:
+            verbose: Whether to show detailed output
+        """
         self.verbose = verbose
         self.logger = self._setup_logging()
+        self.gmx_cmd = self._find_gmx_command()
 
     def _setup_logging(self) -> logging.Logger:
-        """Set up logging for the converter"""
+        """Set up logging for the converter."""
         logger = logging.getLogger(__name__)
 
         # Remove any existing handlers
         for handler in logger.handlers[:]:
             logger.removeHandler(handler)
 
-        # Set up file handler for all logs
+        # Set up file handler
         log_file = Path("trajectory_conversion.log")
         file_handler = logging.FileHandler(log_file)
         file_handler.setFormatter(
@@ -102,545 +193,533 @@ class TrajectoryConverter:
             console_handler = logging.StreamHandler()
             console_handler.setFormatter(logging.Formatter("%(message)s"))
             logger.addHandler(console_handler)
+            logger.setLevel(logging.INFO)
+        else:
+            logger.setLevel(logging.ERROR)
 
-        logger.setLevel(logging.INFO)
         return logger
 
-    def _find_topology_files(
-        self, xtc_path: str
-    ) -> Tuple[Optional[str], Optional[str]]:
-        """
-        Find topology and .top files in the same directory as the XTC file.
-
-        Args:
-            xtc_path: Path to the XTC file
+    def _find_gmx_command(self) -> str:
+        """Find the GROMACS executable command.
 
         Returns:
-            Tuple[Optional[str], Optional[str]]: Paths to topology and .top files
-        """
-        base_path = os.path.splitext(xtc_path)[0]
-        base_dir = os.path.dirname(xtc_path)
-
-        # Look for structure files
-        struct_file = None
-        for ext in [".gro", ".pdb", ".tpr"]:
-            potential_top = base_path + ext
-            if os.path.exists(potential_top):
-                if self.verbose:
-                    self.logger.info(f"Found structure file: {potential_top}")
-                struct_file = potential_top
-                break
-
-        # Look for topology file
-        top_file = os.path.join(base_dir, "topol.top")
-        if os.path.exists(top_file):
-            if self.verbose:
-                self.logger.info(f"Found topology file: {top_file}")
-            return struct_file, top_file
-
-        return struct_file, None
-
-    def _create_universe(self, xtc_path: str) -> mda.Universe:
-        """
-        Create an MDAnalysis Universe from the trajectory file.
-
-        Args:
-            xtc_path: Path to the XTC file
-
-        Returns:
-            MDAnalysis Universe object
+            str: Path to GROMACS executable
 
         Raises:
-            ValueError: If the trajectory cannot be loaded
+            RuntimeError: If GROMACS cannot be found
         """
-        try:
-            # Use explicitly provided topology file if available
-            if self.topology_file:
-                if not os.path.exists(self.topology_file):
-                    raise ValueError(f"Topology file not found: {self.topology_file}")
-                return mda.Universe(self.topology_file, xtc_path)
+        # Default command
+        gmx_cmd = "gmx"
 
-            # Try to find topology files in the same directory
-            struct_file, found_top = self._find_topology_files(xtc_path)
+        # Check if gmx is in PATH
+        which_gmx = subprocess.run(
+            "which gmx", shell=True, capture_output=True, text=True
+        )
 
-            if struct_file:
-                if found_top and not self.top_file:
-                    self.top_file = found_top
-                return mda.Universe(struct_file, xtc_path)
+        if which_gmx.returncode != 0:
+            # Try common GROMACS installation locations
+            potential_paths = [
+                "/usr/local/gromacs/bin/gmx",
+                "/opt/gromacs/bin/gmx",
+                os.path.expanduser("~/gromacs/bin/gmx"),
+                "/Applications/gromacs/bin/gmx",
+            ]
 
-            # If no topology file found, try to load XTC directly
-            self.logger.warning(
-                "No structure file found. Some metadata will use default values."
-            )
-            return mda.Universe(xtc_path)
+            for path in potential_paths:
+                if os.path.exists(path):
+                    gmx_cmd = path
+                    if self.verbose:
+                        self.logger.info(f"Found GROMACS at: {gmx_cmd}")
+                    break
 
-        except Exception as e:
-            raise ValueError(f"Failed to create Universe from trajectory: {str(e)}")
-
-    def _parse_top_file(self) -> Dict[str, Any]:
-        """
-        Parse GROMACS topology file for additional metadata and bond information.
-
-        Returns:
-            Dict[str, Any]: Dictionary containing parsed metadata and bonds
-        """
-        if not self.top_file or not os.path.exists(self.top_file):
-            return {}
-
-        metadata = {}
-        try:
-            with open(self.top_file, "r") as f:
-                lines = f.readlines()
-
-            # Parse topology file for useful information
-            in_atoms = False
-            in_bonds = False
-            atoms_info = []
-            bonds = []
-            residue_info = {}  # Store residue information by residue number
-
-            for line in lines:
-                line = line.strip()
-                if not line:
-                    continue
-
-                # Check for residue information in comments
-                if line.startswith("; residue"):
-                    try:
-                        parts = line.split()
-                        if len(parts) >= 4:
-                            resid = int(parts[2])  # Get residue number
-                            resname = parts[3]  # Get residue name
-                            residue_info[resid] = resname
-                    except (ValueError, IndexError):
-                        continue
-                    continue
-
-                if line.startswith(";"):
-                    continue
-
-                if "[ atoms ]" in line:
-                    in_atoms = True
-                    in_bonds = False
-                    continue
-                elif "[ bonds ]" in line:
-                    in_atoms = False
-                    in_bonds = True
-                    continue
-                elif line.startswith("["):
-                    in_atoms = False
-                    in_bonds = False
-                    continue
-
-                if in_atoms and line:
-                    parts = line.split()
-                    if len(parts) >= 4:  # Basic atom entry
-                        try:
-                            atom_index = int(parts[0])  # 1-based index in topology
-                            resid = int(parts[2])  # Residue number
-                            atoms_info.append(
-                                {
-                                    "index": atom_index,
-                                    "type": parts[1],
-                                    "resid": resid,
-                                    "resname": residue_info.get(resid, "UNK"),
-                                }
-                            )
-                        except (ValueError, IndexError):
-                            continue
-
-                if in_bonds and line:
-                    try:
-                        parts = [
-                            p for p in line.split() if p.strip()
-                        ]  # Remove empty strings
-                        if len(parts) >= 2:  # Basic bond entry (ai, aj, funct, ...)
-                            # Convert to 0-based indexing for MDAnalysis
-                            ai = int(parts[0].strip()) - 1  # First atom index
-                            aj = int(parts[1].strip()) - 1  # Second atom index
-                            # Log the bond being added
-                            self.logger.debug(
-                                f"Adding bond: {ai+1} - {aj+1} (0-based: {ai} - {aj})"
-                            )
-                            # Store the bond
-                            bonds.append([ai, aj])
-                            # Also store the reverse bond since GROMACS only lists each bond once
-                            bonds.append([aj, ai])
-                    except (ValueError, IndexError) as e:
-                        self.logger.warning(
-                            f"Could not parse bond line '{line}': {str(e)}"
-                        )
-                        continue
-
-            if atoms_info:
-                # Sort atoms by residue ID to ensure correct order
-                atoms_info.sort(key=lambda x: x["resid"])
-
-                # Extract unique residue sequence while preserving order
-                seen_residues = set()
-                residue_sequence = []
-                for atom in atoms_info:
-                    resid = atom["resid"]
-                    if resid not in seen_residues:
-                        seen_residues.add(resid)
-                        residue_sequence.append(atom["resname"])
-
-                metadata["elements"] = [info["type"] for info in atoms_info]
-                metadata["resnames"] = [info["resname"] for info in atoms_info]
-                metadata["atom_indices"] = [info["index"] - 1 for info in atoms_info]
-                metadata["resids"] = [info["resid"] for info in atoms_info]
-                metadata["residue_sequence"] = residue_sequence
-
-            if bonds:
-                self.logger.info(f"Found {len(bonds)} bonds in topology file")
-                metadata["bonds"] = bonds
-            else:
-                self.logger.warning("No bonds found in topology file")
-
-            return metadata
-
-        except Exception as e:
-            self.logger.warning(f"Could not parse topology file: {str(e)}")
-            return {}
-
-    def _get_metadata(self, universe: mda.Universe, frame_num: int) -> MoleculeMetadata:
-        """
-        Extract metadata from the universe for the current frame.
-
-        Args:
-            universe: MDAnalysis Universe object
-            frame_num: Current frame number
-
-        Returns:
-            MoleculeMetadata object with frame information
-        """
-        if not universe:
-            return MoleculeMetadata.create_default(frame_num)
-
-        try:
-            # Try to get residue information
-            if hasattr(universe, "residues") and universe.residues:
-                residue_sequence = []
-                numbered_sequence = []
-                for res in universe.residues:
-                    try:
-                        resname = getattr(res, "resname", "UNK")
-                        resid = getattr(res, "resid", len(residue_sequence) + 1)
-                        residue_sequence.append(resname)
-                        numbered_sequence.append(f"{resname}{resid}")
-                    except Exception:
-                        residue_sequence.append("UNK")
-                        numbered_sequence.append(f"UNK{len(residue_sequence)}")
-            else:
-                # Create a single residue for all atoms if no residue information
-                residue_sequence = ["UNK"]
-                numbered_sequence = ["UNK1"]
-
-            # Get time and box information safely
-            try:
-                time = universe.trajectory.time
-            except Exception:
-                time = 0.0
-
-            try:
-                box_dimensions = universe.dimensions.tolist()
-            except Exception:
-                box_dimensions = [0.0, 0.0, 0.0, 90.0, 90.0, 90.0]
-
-            return MoleculeMetadata(
-                compound_name=os.path.basename(self.topology_file or "unknown"),
-                frame_num=frame_num,
-                residue_sequence=residue_sequence,
-                numbered_sequence=numbered_sequence,
-                time=time,
-                box_dimensions=box_dimensions,
-            )
-
-        except Exception as e:
-            self.logger.warning(f"Error extracting metadata: {str(e)}, using defaults")
-            return MoleculeMetadata.create_default(frame_num)
-
-    def _apply_metadata(self, universe: mda.Universe) -> None:
-        """
-        Apply metadata to the universe if provided.
-
-        Args:
-            universe: MDAnalysis Universe to modify
-        """
-        if not universe or not universe.atoms:
-            return
-
-        # First try to get metadata from topology file
-        top_metadata = self._parse_top_file()
-
-        # Combine with user-provided metadata, giving preference to user values
-        combined_metadata = {**top_metadata, **self.metadata}
-
-        try:
-            n_atoms = len(universe.atoms)
-
-            # First, set up residues if we have the sequence information
-            if "residue_sequence" in combined_metadata:
-                residue_sequence = combined_metadata["residue_sequence"]
-
-                # Get atom-to-residue mapping from topology if available
-                atom_residue_mapping = {}
-                if "resids" in combined_metadata:
-                    topology_resids = combined_metadata["resids"]
-                    if len(topology_resids) == n_atoms:
-                        # Use the mapping from topology
-                        resids = topology_resids
-                        resnames = combined_metadata.get("resnames", [])
-                        if len(resnames) == n_atoms:
-                            # We have complete residue information from topology
-                            self.logger.info("Using residue mapping from topology file")
-                            universe.add_TopologyAttr("resids", resids)
-                            universe.add_TopologyAttr("resnames", resnames)
-                        else:
-                            # Map resnames based on resids
-                            unique_resids = sorted(set(resids))
-                            resid_to_resname = {
-                                resid: residue_sequence[i % len(residue_sequence)]
-                                for i, resid in enumerate(unique_resids)
-                            }
-                            resnames = [resid_to_resname[resid] for resid in resids]
-                            universe.add_TopologyAttr("resids", resids)
-                            universe.add_TopologyAttr("resnames", resnames)
-                    else:
-                        self.logger.warning(
-                            f"Topology resids length ({len(topology_resids)}) "
-                            f"doesn't match number of atoms ({n_atoms})"
-                        )
-
-                if "resids" not in combined_metadata or len(topology_resids) != n_atoms:
-                    # Calculate atoms per residue based on total atoms and number of residues
-                    n_residues = len(residue_sequence)
-                    base_atoms_per_res = n_atoms // n_residues
-                    remaining_atoms = n_atoms % n_residues
-
-                    # Distribute atoms among residues
-                    resids = []
-                    resnames = []
-                    current_resid = 1
-                    atoms_assigned = 0
-
-                    for i, resname in enumerate(residue_sequence):
-                        # Calculate how many atoms belong to this residue
-                        atoms_this_res = base_atoms_per_res
-                        if i < remaining_atoms:
-                            atoms_this_res += 1
-
-                        # Assign residue ID and name to each atom in this residue
-                        resids.extend([current_resid] * atoms_this_res)
-                        resnames.extend([resname] * atoms_this_res)
-                        current_resid += 1
-                        atoms_assigned += atoms_this_res
-
-                    # Verify we assigned all atoms
-                    if atoms_assigned != n_atoms:
-                        raise ValueError(
-                            f"Atom assignment mismatch. Expected {n_atoms}, "
-                            f"assigned {atoms_assigned}"
-                        )
-
-                    # Apply the residue attributes
-                    universe.add_TopologyAttr("resids", resids)
-                    universe.add_TopologyAttr("resnames", resnames)
-                    self.logger.info(
-                        f"Distributed {n_atoms} atoms across {n_residues} residues"
-                    )
-
-            else:
-                # If no sequence information, create one residue for all atoms
-                resids = [1] * n_atoms
-                resnames = ["UNK"] * n_atoms
-                universe.add_TopologyAttr("resids", resids)
-                universe.add_TopologyAttr("resnames", resnames)
-
-            # Create a single segment for the whole molecule
-            universe.add_TopologyAttr("segids", ["A"] * n_atoms)
-
-            # Add chain IDs (one chain for all residues)
-            universe.add_TopologyAttr("chainIDs", ["A"] * n_atoms)
-
-            # Apply atom level attributes
-            ATOM_ATTRS = {
-                "names",
-                "types",
-                "elements",
-                "occupancies",
-                "tempfactors",
-                "altLocs",
-            }
-
-            for attr in ATOM_ATTRS:
-                if attr in combined_metadata:
-                    try:
-                        values = combined_metadata[attr]
-                        if len(values) >= len(universe.atoms):
-                            universe.add_TopologyAttr(
-                                attr, values[: len(universe.atoms)]
-                            )
-                    except Exception as e:
-                        self.logger.warning(f"Could not apply {attr}: {str(e)}")
-
-            # Apply bond information if available
-            if "bonds" in combined_metadata:
+            # If still not found, try sourcing GMXRC
+            if gmx_cmd == "gmx":
                 try:
-                    bonds = combined_metadata["bonds"]
-                    # Add bonds to the universe
-                    universe.add_TopologyAttr("bonds", bonds)
-                    self.logger.info(f"Added {len(bonds)} bonds from topology file")
+                    if self.verbose:
+                        self.logger.info("Trying to source GROMACS environment...")
+                    gmxrc_paths = [
+                        "/usr/local/gromacs/bin/GMXRC",
+                        "/opt/gromacs/bin/GMXRC",
+                        os.path.expanduser("~/gromacs/bin/GMXRC"),
+                        "/Applications/gromacs/bin/GMXRC",
+                    ]
+
+                    for gmxrc in gmxrc_paths:
+                        if os.path.exists(gmxrc):
+                            source_cmd = f"source {gmxrc} && which gmx"
+                            result = subprocess.run(
+                                source_cmd,
+                                shell=True,
+                                executable="/bin/bash",
+                                capture_output=True,
+                                text=True,
+                            )
+                            if result.returncode == 0 and result.stdout.strip():
+                                gmx_cmd = result.stdout.strip()
+                                if self.verbose:
+                                    self.logger.info(
+                                        f"GROMACS sourced from {gmxrc}. Using: {gmx_cmd}"
+                                    )
+                                break
                 except Exception as e:
-                    self.logger.warning(f"Could not apply bonds: {str(e)}")
+                    self.logger.error(f"Error sourcing GROMACS: {e}")
 
-        except Exception as e:
-            self.logger.warning(f"Error applying metadata: {str(e)}")
-
-    def _copy_to_local(self, file_path: str) -> Path:
-        """Copy a file to a local temporary directory."""
-        # Create temporary directory in user's home
-        temp_dir = Path.home() / ".mdanalysis_temp"
-        temp_dir.mkdir(exist_ok=True)
-
-        # Create a unique subdirectory for this process
-        process_dir = temp_dir / f"process_{os.getpid()}"
-        process_dir.mkdir(exist_ok=True)
-
-        # Copy file to temporary location
-        src_path = Path(file_path)
-        temp_path = process_dir / src_path.name
-
-        with open(src_path, "rb") as src, open(temp_path, "wb") as dst:
-            shutil.copyfileobj(src, dst)
-
-        return temp_path
-
-    def get_trajectory_info(self, xtc_path: str) -> dict:
-        """Get information about a trajectory file."""
-        if not os.path.exists(xtc_path):
-            raise ValueError(f"XTC file not found: {xtc_path}")
-
-        try:
-            # Copy files to local storage
-            local_xtc = self._copy_to_local(xtc_path)
-            local_top = (
-                self._copy_to_local(self.topology_file) if self.topology_file else None
+        if gmx_cmd == "gmx" and which_gmx.returncode != 0:
+            raise RuntimeError(
+                "Could not find GROMACS executable. Please ensure GROMACS is installed and in your PATH."
             )
 
-            with warnings.catch_warnings():
-                warnings.filterwarnings("ignore", category=UserWarning)
-                if local_top:
-                    universe = mda.Universe(str(local_top), str(local_xtc))
-                else:
-                    universe = mda.Universe(str(local_xtc))
+        return gmx_cmd
 
-            if not universe or not universe.atoms:
-                raise ValueError("Could not create universe from trajectory")
+    def _create_minimal_mdp(self, output_path: Path) -> None:
+        """Create a minimal MDP file for grompp.
 
-            # Try to parse topology file
-            top_metadata = self._parse_top_file()
+        Args:
+            output_path: Path to write the MDP file
+        """
+        with open(output_path, "w") as f:
+            f.write("integrator = md\nnsteps = 0\n")
 
-            # Get initial frame metadata
-            metadata = self._get_metadata(universe, 0)
+    def _copy_file_chunked(
+        self, src_path: str, dst_path: Path, chunk_size: int = 1024 * 1024
+    ) -> None:
+        """Copy a file in chunks to handle large files.
 
-            return {
-                "n_frames": len(universe.trajectory),
-                "n_atoms": len(universe.atoms),
-                "time_range": (
-                    universe.trajectory[0].time,
-                    universe.trajectory[-1].time,
-                ),
-                "dimensions": universe.dimensions.tolist(),
-                "topology_source": self.topology_file or "inferred",
-                "top_file": self.top_file,
-                "residue_sequence": metadata.residue_sequence if metadata else [],
-                "numbered_sequence": metadata.numbered_sequence if metadata else [],
-                "metadata_status": {
-                    "resnames": hasattr(universe.atoms, "resnames")
-                    or bool(top_metadata.get("resnames")),
-                    "chainIDs": hasattr(universe.atoms, "chainIDs"),
-                    "resids": hasattr(universe.atoms, "resids"),
-                    "names": hasattr(universe.atoms, "names"),
-                    "elements": hasattr(universe.atoms, "elements")
-                    or bool(top_metadata.get("elements")),
-                },
+        Args:
+            src_path: Source file path
+            dst_path: Destination file path
+            chunk_size: Size of chunks to copy (default: 1MB)
+        """
+        with open(src_path, "rb") as fsrc:
+            with open(dst_path, "wb") as fdst:
+                while True:
+                    chunk = fsrc.read(chunk_size)
+                    if not chunk:
+                        break
+                    fdst.write(chunk)
+                    fdst.flush()
+                    os.fsync(fdst.fileno())
+
+    def get_trajectory_info(
+        self, xtc_path: str, gro_path: str, top_path: str
+    ) -> Dict[str, Any]:
+        """Get information about a trajectory file using GROMACS.
+
+        Args:
+            xtc_path: Path to XTC trajectory file
+            gro_path: Path to GRO structure file
+            top_path: Path to TOP topology file
+
+        Returns:
+            Dict containing trajectory information
+        """
+        with tempfile.TemporaryDirectory(prefix="traj_info_") as temp_dir:
+            temp_dir_path = Path(temp_dir)
+
+            # Copy files to temporary directory
+            local_xtc = temp_dir_path / "traj.xtc"
+            local_gro = temp_dir_path / "conf.gro"
+            local_top = temp_dir_path / "topol.top"
+            local_mdp = temp_dir_path / "temp.mdp"
+            local_tpr = temp_dir_path / "temp.tpr"
+
+            self._copy_file_chunked(xtc_path, local_xtc)
+            self._copy_file_chunked(gro_path, local_gro)
+            self._copy_file_chunked(top_path, local_top)
+
+            # Create minimal MDP file
+            self._create_minimal_mdp(local_mdp)
+
+            # Create TPR file
+            cmd_grompp = f"{self.gmx_cmd} grompp -f {local_mdp} -c {local_gro} -p {local_top} -o {local_tpr} -maxwarn 100"
+            result = subprocess.run(
+                cmd_grompp, shell=True, capture_output=True, text=True
+            )
+
+            if result.returncode != 0:
+                raise RuntimeError(f"Failed to create TPR file: {result.stderr}")
+
+            # Get trajectory information
+            cmd_check = f"{self.gmx_cmd} check -f {local_xtc}"
+            result = subprocess.run(
+                cmd_check, shell=True, capture_output=True, text=True
+            )
+
+            info = {
+                "n_frames": 0,
+                "n_atoms": 0,
+                "time_range": (0, 0),
+                "topology_source": gro_path,
+                "top_file": top_path,
             }
-        except Exception as e:
-            raise ValueError(f"Failed to get trajectory info: {str(e)}")
-        finally:
-            # Clean up temporary files
-            if "local_xtc" in locals():
-                try:
-                    local_xtc.unlink()
-                except:
-                    pass
-            if "local_top" in locals() and local_top:
-                try:
-                    local_top.unlink()
-                except:
-                    pass
 
-    def xtc_to_multimodel_pdb(
+            # Parse gmx check output
+            for line in result.stdout.split("\n") + result.stderr.split("\n"):
+                if "Number of frames" in line:
+                    info["n_frames"] = int(line.split()[-1])
+                elif "Number of atoms" in line:
+                    info["n_atoms"] = int(line.split()[-1])
+                elif "Last frame time" in line:
+                    info["time_range"] = (0, float(line.split()[-1]))
+
+            return info
+
+    def convert_trajectory(
         self,
-        xtc_file: str,
+        xtc_path: str,
+        gro_path: str,
+        top_path: str,
         output_dir: str,
         start: int = 0,
         end: Optional[int] = None,
         stride: int = 1,
-    ) -> None:
-        """Convert XTC trajectory to multi-model PDB."""
-        # Disable all MDAnalysis warnings
-        warnings.filterwarnings("ignore", category=UserWarning)
-        warnings.filterwarnings("ignore", category=RuntimeWarning)
+    ) -> List[Path]:
+        """Convert XTC trajectory to PDB using GROMACS.
 
-        try:
-            # Copy files to local storage
-            local_xtc = self._copy_to_local(xtc_file)
-            local_top = self._copy_to_local(self.topology_file)
+        Args:
+            xtc_path: Path to XTC trajectory file
+            gro_path: Path to GRO structure file
+            top_path: Path to TOP topology file
+            output_dir: Directory to write output files
+            start: First frame to convert (0-based)
+            end: Last frame to convert (None = all frames)
+            stride: Step size for frame selection
 
-            # Create Universe using local copies
-            u = mda.Universe(str(local_top), str(local_xtc))
+        Returns:
+            List of output file paths
+        """
+        output_dir_path = Path(output_dir)
+        output_dir_path.mkdir(parents=True, exist_ok=True)
 
-            # Get the output path
-            output_path = Path(output_dir) / "md_Ref.pdb"
+        with tempfile.TemporaryDirectory(prefix="traj_convert_") as temp_dir:
+            temp_dir_path = Path(temp_dir)
 
-            # Create a context manager for the progress bar
-            total_frames = len(
-                range(start, len(u.trajectory) if end is None else end, stride)
+            # Copy files to temporary directory
+            local_xtc = temp_dir_path / "traj.xtc"
+            local_gro = temp_dir_path / "conf.gro"
+            local_top = temp_dir_path / "topol.top"
+            local_mdp = temp_dir_path / "temp.mdp"
+            local_tpr = temp_dir_path / "temp.tpr"
+            local_pdb = temp_dir_path / "md_Ref.pdb"
+
+            if self.verbose:
+                self.logger.info("Copying files to temporary directory...")
+
+            self._copy_file_chunked(xtc_path, local_xtc)
+            self._copy_file_chunked(gro_path, local_gro)
+            self._copy_file_chunked(top_path, local_top)
+
+            # Create minimal MDP file
+            if self.verbose:
+                self.logger.info("Creating minimal MDP file...")
+            self._create_minimal_mdp(local_mdp)
+
+            # Create TPR file
+            if self.verbose:
+                self.logger.info("Creating TPR file...")
+
+            cmd_grompp = f"{self.gmx_cmd} grompp -f {local_mdp} -c {local_gro} -p {local_top} -o {local_tpr} -maxwarn 100"
+            result = subprocess.run(
+                cmd_grompp, shell=True, capture_output=True, text=True
             )
 
-            # Use tqdm only if this is not a child process and not quiet mode
-            is_main_process = not bool(os.getenv("PARALLEL_WORKER"))
-            is_quiet = not self.verbose or bool(os.getenv("QUIET"))
+            if result.returncode != 0:
+                raise RuntimeError(f"Failed to create TPR file: {result.stderr}")
 
-            with tqdm(
-                total=total_frames,
-                desc="Converting frames",
-                disable=not is_main_process or is_quiet,
-                leave=False,
-                position=1,
-                ncols=80,
-            ) as pbar:
-                # Process frames
-                with PDBWriter(str(output_path)) as pdb:
-                    for ts in u.trajectory[start:end:stride]:
-                        pdb.write(u.atoms)
-                        pbar.update(1)
+            # Convert trajectory
+            if self.verbose:
+                self.logger.info("Converting trajectory to PDB...")
+
+            # Build trjconv command with frame selection
+            trjconv_cmd = f"echo 0 | {self.gmx_cmd} trjconv -s {local_tpr} -f {local_xtc} -o {local_pdb} -pbc mol -conect"
+
+            if start > 0:
+                trjconv_cmd += f" -b {start}"
+            if end is not None:
+                trjconv_cmd += f" -e {end}"
+            if stride > 1:
+                trjconv_cmd += f" -skip {stride}"
+
+            result = subprocess.run(
+                trjconv_cmd, shell=True, capture_output=True, text=True
+            )
+
+            if result.returncode != 0:
+                raise RuntimeError(f"Failed to convert trajectory: {result.stderr}")
+
+            # Get residue sequence from the topology file to add SEQRES
+            residue_sequence = self._extract_residue_sequence(top_path)
+            if residue_sequence and self.verbose:
+                self.logger.info(f"Found residue sequence: {residue_sequence}")
+
+            # Customize PDB header format
+            self._customize_pdb_header(
+                local_pdb, Path(xtc_path).parent.name, residue_sequence
+            )
+
+            # Copy result to output directory
+            output_pdb = output_dir_path / "md_Ref.pdb"
+            if self.verbose:
+                self.logger.info(f"Copying result to {output_pdb}...")
+
+            self._copy_file_chunked(local_pdb, output_pdb)
+
+            # Verify CONECT records were written
+            if self.verbose:
+                with open(output_pdb, "r") as f:
+                    content = f.read()
+                    conect_lines = [
+                        line
+                        for line in content.split("\n")
+                        if line.startswith("CONECT")
+                    ]
+                    self.logger.info(
+                        f"Number of CONECT records written: {len(conect_lines)}"
+                    )
+                    if conect_lines:
+                        self.logger.info("Sample CONECT records:")
+                        for line in conect_lines[:5]:
+                            self.logger.info(line)
+
+            return [output_pdb]
+
+    def _extract_residue_sequence(self, top_path: str) -> List[str]:
+        """Extract residue sequence from a GROMACS topology file.
+
+        Args:
+            top_path: Path to the GROMACS topology file
+
+        Returns:
+            List of residue names in sequence
+        """
+        try:
+            residues = []
+            in_molecules = False
+            in_atoms = False
+            residue_types = {}
+
+            # First pass: extract residue info from atoms section
+            with open(top_path, "r") as f:
+                for line in f:
+                    line = line.strip()
+
+                    # Skip empty lines and comments
+                    if not line or line.startswith(";"):
+                        continue
+
+                    # Check for sections
+                    if line.startswith("["):
+                        section = line.strip("[]").strip()
+                        in_atoms = section == "atoms"
+                        in_molecules = section == "molecules"
+                        continue
+
+                    # Process atoms section to get residue types
+                    if in_atoms:
+                        parts = line.split()
+                        if len(parts) >= 5:  # Ensure we have enough fields
+                            try:
+                                # Extract residue id and name
+                                resid = int(parts[2]) if parts[2].isdigit() else 0
+                                resname = parts[3]
+                                if resid > 0:
+                                    residue_types[resid] = resname
+                            except Exception as e:
+                                if self.verbose:
+                                    self.logger.warning(
+                                        f"Error parsing atom line: {str(e)}"
+                                    )
+
+                    # Process molecules section as backup
+                    elif in_molecules:
+                        parts = line.split()
+                        if len(parts) >= 2 and parts[0].lower() != "system":
+                            try:
+                                residue_name = parts[0]
+                                count = int(parts[1])
+                                # Add residue multiple times based on count
+                                for _ in range(count):
+                                    residues.append(residue_name)
+                            except Exception as e:
+                                if self.verbose:
+                                    self.logger.warning(
+                                        f"Error parsing molecule line: {str(e)}"
+                                    )
+
+            # If we found residue types from atoms section, use them
+            if residue_types:
+                # Sort by resid to get the correct sequence
+                sorted_resids = sorted(residue_types.keys())
+                residues = [residue_types[resid] for resid in sorted_resids]
+
+            # Filter out system entries
+            residues = [r for r in residues if r.lower() != "system"]
+
+            # If no valid residues found, try to use file name
+            if not residues:
+                dir_name = os.path.basename(os.path.dirname(top_path))
+                if dir_name.startswith("x_") and dir_name[2:].isdigit():
+                    # For x_177 type directories, extract residue info from another source
+                    try:
+                        # Extract three-letter codes from gro file
+                        gro_file = os.path.join(os.path.dirname(top_path), "md_Ref.gro")
+                        if os.path.exists(gro_file):
+                            res_set = set()
+                            with open(gro_file, "r") as gf:
+                                # Skip first two lines
+                                next(gf)
+                                next(gf)
+                                for line in gf:
+                                    if len(line) >= 10:
+                                        res_name = line[5:8].strip()
+                                        if res_name and len(res_name) == 3:
+                                            res_set.add(res_name)
+                            residues = list(res_set)
+                    except Exception as e:
+                        if self.verbose:
+                            self.logger.warning(
+                                f"Error extracting residue info from GRO file: {str(e)}"
+                            )
+
+            if self.verbose:
+                self.logger.info(f"Extracted residue sequence: {residues}")
+            return residues
+        except Exception as e:
+            if self.verbose:
+                self.logger.warning(f"Error extracting residue sequence: {str(e)}")
+            return []
+
+    def _customize_pdb_header(
+        self, pdb_path: Path, compound_name: str, residue_sequence: List[str]
+    ) -> None:
+        """Customize the PDB header format.
+
+        Args:
+            pdb_path: Path to the PDB file
+            compound_name: Name of the compound (typically directory name)
+            residue_sequence: List of residue names
+        """
+        try:
+            with open(pdb_path, "r") as f:
+                lines = f.readlines()
+
+            # Extract model sections
+            model_sections = []
+            current_section = []
+            in_model = False
+
+            for line in lines:
+                if line.startswith("MODEL"):
+                    in_model = True
+                    current_section = [line]
+                elif line.startswith("ENDMDL"):
+                    current_section.append(line)
+                    model_sections.append(current_section)
+                    in_model = False
+                    current_section = []
+                elif in_model:
+                    current_section.append(line)
+
+            # Compile new PDB content with custom headers
+            new_lines = []
+            frame_number = 0
+
+            for section in model_sections:
+                # Add custom header
+                new_lines.append(f"TITLE {compound_name}\n")
+
+                # Add SEQRES if available
+                if residue_sequence:
+                    residues_per_line = 13  # Max residues per SEQRES line
+                    for i in range(0, len(residue_sequence), residues_per_line):
+                        chunk = residue_sequence[i : i + residues_per_line]
+                        line_num = i // residues_per_line + 1
+                        seqres_line = f"SEQRES  {line_num:2d} A {len(residue_sequence):4d}  {' '.join(chunk)}\n"
+                        new_lines.append(seqres_line)
+
+                # Add frame remark
+                new_lines.append(f"REMARK frame={frame_number}\n")
+
+                # Add model line and atom records (skip CRYST1)
+                found_model_line = False
+                for line in section:
+                    if line.startswith("MODEL"):
+                        new_lines.append("MODEL 1\n")  # Always use MODEL 1
+                        found_model_line = True
+                    elif line.startswith(("ATOM", "HETATM", "TER", "CONECT", "END")):
+                        new_lines.append(line)
+
+                if not found_model_line:
+                    # If no MODEL line found, insert one before first atom
+                    for i, line in enumerate(new_lines):
+                        if line.startswith("ATOM"):
+                            new_lines.insert(i, "MODEL 1\n")
+                            break
+
+                frame_number += 1
+
+            # Write back to file
+            with open(pdb_path, "w") as f:
+                f.writelines(new_lines)
+
+            if self.verbose:
+                self.logger.info(f"Customized PDB header format for {pdb_path}")
 
         except Exception as e:
             if self.verbose:
-                self.logger.error(f"Error converting trajectory {xtc_file}: {str(e)}")
-            raise
-        finally:
-            # Clean up temporary files
-            if "local_xtc" in locals():
-                try:
-                    local_xtc.unlink()
-                except:
-                    pass
-            if "local_top" in locals():
-                try:
-                    local_top.unlink()
-                except:
-                    pass
+                self.logger.warning(f"Error customizing PDB header: {str(e)}")
+
+    def _ensure_seqres_in_pdb(
+        self, pdb_path: Path, residue_sequence: List[str]
+    ) -> None:
+        """Ensure the PDB file has SEQRES records.
+
+        Args:
+            pdb_path: Path to the PDB file
+            residue_sequence: List of residue names in sequence
+        """
+        try:
+            with open(pdb_path, "r") as f:
+                lines = f.readlines()
+
+            # Check if SEQRES already exists
+            has_seqres = any(line.startswith("SEQRES") for line in lines)
+
+            if not has_seqres and residue_sequence:
+                # Find where to insert SEQRES (after REMARK, TITLE, CRYST1 but before MODEL)
+                insert_idx = 0
+                for i, line in enumerate(lines):
+                    if line.startswith(("REMARK", "TITLE", "CRYST1")):
+                        insert_idx = i + 1
+                    elif line.startswith("MODEL"):
+                        break
+
+                # Format SEQRES record according to PDB format
+                residues_per_line = 13  # Max residues per SEQRES line
+                seqres_lines = []
+
+                for i in range(0, len(residue_sequence), residues_per_line):
+                    chunk = residue_sequence[i : i + residues_per_line]
+                    line_num = i // residues_per_line + 1
+                    seqres_line = f"SEQRES  {line_num:2d} A {len(residue_sequence):4d}  {' '.join(chunk)}\n"
+                    seqres_lines.append(seqres_line)
+
+                # Insert SEQRES lines
+                for i, seqres_line in enumerate(seqres_lines):
+                    lines.insert(insert_idx + i, seqres_line)
+
+                # Write back to file
+                with open(pdb_path, "w") as f:
+                    f.writelines(lines)
+
+                if self.verbose:
+                    self.logger.info(
+                        f"Added {len(seqres_lines)} SEQRES records to PDB file"
+                    )
+
+        except Exception as e:
+            if self.verbose:
+                self.logger.warning(f"Error ensuring SEQRES records: {str(e)}")
+
+
+# Keep the TrajectoryConverter class as a legacy option or for future use

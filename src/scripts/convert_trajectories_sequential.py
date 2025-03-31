@@ -3,7 +3,7 @@
 
 """
 Script to convert molecular dynamics trajectories between different formats sequentially.
-Currently supports converting XTC to multi-model PDB files.
+Currently supports converting XTC to multi-model PDB files using GROMACS.
 """
 
 import os
@@ -13,11 +13,52 @@ from pathlib import Path
 from tqdm.auto import tqdm
 import warnings
 from typing import List
+import json
+import tempfile
 
 # Disable MDAnalysis file locking
 os.environ["MDANALYSIS_NO_FD_CACHE"] = "1"
 
-from src.core.services.trajectory_converter import TrajectoryConverter
+from src.core.services.gmx_converter import GromacsPDBConverter
+
+
+def check_conversion_summary(output_dir: Path) -> bool:
+    """
+    Check if a directory has been successfully converted by examining the summary file.
+
+    Args:
+        output_dir: Directory to check for conversion summary
+
+    Returns:
+        True if directory has been successfully converted, False otherwise
+    """
+    summary_file = output_dir / "conversion_summary.json"
+    pdb_file = output_dir / "md_Ref.pdb"
+
+    if not (
+        summary_file.exists() and pdb_file.exists() and pdb_file.stat().st_size > 0
+    ):
+        return False
+
+    try:
+        with open(summary_file) as f:
+            summary = json.load(f)
+
+        # Check for required fields
+        required_fields = ["n_frames", "n_atoms", "timestamp", "conversion_version"]
+        if not all(field in summary for field in required_fields):
+            return False
+
+        # Check if the PDB file size is reasonable given the number of frames and atoms
+        expected_min_size = (
+            summary["n_frames"] * summary["n_atoms"] * 50
+        )  # Rough estimate of minimum expected size
+        if pdb_file.stat().st_size < expected_min_size:
+            return False
+
+        return True
+    except (json.JSONDecodeError, KeyError, OSError):
+        return False
 
 
 def write_conversion_summary(
@@ -25,7 +66,6 @@ def write_conversion_summary(
     xtc_path: str,
     n_frames: int,
     n_atoms: int,
-    residue_sequence: List[str],
 ) -> None:
     """
     Write a summary of the conversion process.
@@ -35,7 +75,6 @@ def write_conversion_summary(
         xtc_path: Path to input XTC file
         n_frames: Number of frames processed
         n_atoms: Number of atoms
-        residue_sequence: List of residue names
     """
     import datetime
     import json
@@ -45,7 +84,6 @@ def write_conversion_summary(
         "timestamp": datetime.datetime.now().isoformat(),
         "n_frames": n_frames,
         "n_atoms": n_atoms,
-        "residue_sequence": residue_sequence,
         "conversion_version": "1.0",
     }
 
@@ -59,8 +97,9 @@ def process_trajectory(
     gro_path: Path,
     top_path: Path,
     output_base: Path,
+    force: bool = False,
     verbose: bool = False,
-) -> None:
+) -> bool:
     """
     Process a single trajectory file.
 
@@ -69,50 +108,74 @@ def process_trajectory(
         gro_path: Path to GRO topology file
         top_path: Path to TOP topology file
         output_base: Base directory for output
+        force: Whether to force reprocessing
         verbose: Whether to show detailed output
+
+    Returns:
+        True if processing was needed and successful, False if skipped
     """
     # Use the directory containing the XTC file as the output directory
     output_dir = xtc_path.parent
 
-    # Skip if already processed
-    pdb_file = output_dir / "md_Ref.pdb"
-    summary_file = output_dir / "conversion_summary.json"
-    if pdb_file.exists() and pdb_file.stat().st_size > 0 and summary_file.exists():
-        return
+    # Skip if already processed successfully
+    if not force and check_conversion_summary(output_dir):
+        logging.info(f"Skipping {xtc_path} - already successfully converted")
+        return False
 
-    # Initialize converter
-    converter = TrajectoryConverter(
-        topology_file=str(gro_path), top_file=str(top_path), verbose=verbose
-    )
+    # Create a temporary directory for processing
+    with tempfile.TemporaryDirectory(prefix="traj_convert_") as temp_dir:
+        temp_dir_path = Path(temp_dir)
 
-    # Get trajectory information first
-    traj_info = converter.get_trajectory_info(str(xtc_path))
-    n_frames = traj_info.get("n_frames", 0)
-    n_atoms = traj_info.get("n_atoms", 0)
-    residue_sequence = traj_info.get("residue_sequence", ["UNK"])
+        try:
+            # Initialize converter
+            converter = GromacsPDBConverter(verbose=verbose)
 
-    # Write initial conversion summary
-    write_conversion_summary(
-        output_dir,
-        xtc_path,
-        n_frames=n_frames,
-        n_atoms=n_atoms,
-        residue_sequence=residue_sequence,
-    )
+            # Get trajectory information first
+            traj_info = converter.get_trajectory_info(
+                str(xtc_path), str(gro_path), str(top_path)
+            )
+            n_frames = traj_info.get("n_frames", 0)
+            n_atoms = traj_info.get("n_atoms", 0)
 
-    # Convert trajectory
-    converter.xtc_to_multimodel_pdb(
-        str(xtc_path), str(output_dir), start=0, end=None, stride=1
-    )
+            # Write initial conversion summary
+            write_conversion_summary(
+                output_dir,
+                str(xtc_path),
+                n_frames=n_frames,
+                n_atoms=n_atoms,
+            )
 
-    # Update conversion summary with completion timestamp
-    write_conversion_summary(
-        output_dir,
-        xtc_path,
-        n_frames=n_frames,
-        n_atoms=n_atoms,
-        residue_sequence=residue_sequence,
-    )
+            # Convert trajectory
+            output_files = converter.convert_trajectory(
+                xtc_path=str(xtc_path),
+                gro_path=str(gro_path),
+                top_path=str(top_path),
+                output_dir=str(output_dir),
+                start=0,
+                end=None,
+                stride=1,
+            )
+
+            # Update conversion summary with completion timestamp
+            write_conversion_summary(
+                output_dir,
+                str(xtc_path),
+                n_frames=n_frames,
+                n_atoms=n_atoms,
+            )
+
+            return True
+
+        except Exception as e:
+            # Clean up partial output on error
+            try:
+                for file in output_dir.glob("conversion_summary.json"):
+                    file.unlink()
+                for file in output_dir.glob("md_Ref.pdb"):
+                    file.unlink()
+            except:
+                pass
+            raise  # Re-raise the exception after cleanup
 
 
 def main():
@@ -142,13 +205,12 @@ def main():
     log_dir = Path("logs")
     log_dir.mkdir(exist_ok=True)
     log_file = log_dir / "trajectory_conversion.log"
+
+    # Set up file logging only
     logging.basicConfig(
         level=logging.INFO if args.verbose else logging.ERROR,
         format="%(asctime)s - %(levelname)s - %(message)s",
-        handlers=[
-            logging.FileHandler(log_file),
-            logging.StreamHandler() if args.verbose else logging.NullHandler(),
-        ],
+        handlers=[logging.FileHandler(log_file)],
     )
 
     # Disable MDAnalysis warnings
@@ -156,10 +218,11 @@ def main():
     warnings.filterwarnings("ignore", category=RuntimeWarning)
 
     # Find all trajectory sets
-    print("Scanning for trajectory files...")
+    if not args.quiet:
+        print("Scanning for trajectory files...")
     trajectory_sets = []
 
-    for xtc_file in base_dir.rglob("*.xtc"):
+    for xtc_file in base_dir.rglob("300K_fit_4000.xtc"):  # Only look for 4000.xtc files
         # Skip macOS hidden files
         if xtc_file.name.startswith("._"):
             continue
@@ -171,43 +234,66 @@ def main():
             trajectory_sets.append((xtc_file, gro_file, top_file))
 
     if not trajectory_sets:
-        print(f"No valid trajectory sets found in {base_dir}")
+        if not args.quiet:
+            print(f"No valid 300K_fit_4000.xtc trajectory sets found in {base_dir}")
         return
 
-    total = len(trajectory_sets)
-    print(f"Found {total} trajectory sets to process")
+    if not args.quiet:
+        print(f"Found {len(trajectory_sets)} trajectory sets to process")
 
     # Process trajectories sequentially with progress bar
     errors = []
+    processed = 0
+    skipped = 0
+
     with tqdm(
-        total=total,
-        desc="Converting trajectories",
+        total=len(trajectory_sets),
+        desc="Converting trajectories (processed=0, skipped=0, errors=0)",
         unit="traj",
         disable=args.quiet,
-        ncols=100,
+        ncols=120,
     ) as pbar:
         for xtc_path, gro_path, top_path in trajectory_sets:
             try:
-                process_trajectory(
-                    xtc_path, gro_path, top_path, base_dir, verbose=args.verbose
-                )
+                if process_trajectory(
+                    xtc_path,
+                    gro_path,
+                    top_path,
+                    base_dir,
+                    force=args.force,
+                    verbose=args.verbose,
+                ):
+                    processed += 1
+                else:
+                    skipped += 1
             except Exception as e:
                 error_msg = f"Error processing {xtc_path}: {str(e)}"
                 errors.append(error_msg)
                 logging.error(error_msg)
             finally:
+                # Update progress bar description with current counts
+                pbar.set_description(
+                    f"Converting trajectories (processed={processed}, skipped={skipped}, errors={len(errors)})"
+                )
                 pbar.update(1)
 
-    if errors:
-        print(f"\nCompleted with {len(errors)} errors.")
-        print(f"Log file location: {log_file.absolute()}")
-        print("\nFirst few errors:")
-        for error in errors[:5]:  # Show first 5 errors
-            print(f"- {error}")
-        if len(errors) > 5:
-            print(
-                f"... and {len(errors) - 5} more errors. See log file for complete details."
-            )
+    # Only show summary if verbose or there were errors
+    if args.verbose or errors:
+        print(f"\nProcessing complete:")
+        print(f"- Successfully processed: {processed}")
+        print(f"- Skipped (already converted): {skipped}")
+        print(f"- Errors: {len(errors)}")
+
+        if errors:
+            print(f"\nLog file location: {log_file.absolute()}")
+            if args.verbose:
+                print("\nFirst few errors:")
+                for error in errors[:5]:  # Show first 5 errors
+                    print(f"- {error}")
+                if len(errors) > 5:
+                    print(
+                        f"... and {len(errors) - 5} more errors. See log file for complete details."
+                    )
 
 
 if __name__ == "__main__":

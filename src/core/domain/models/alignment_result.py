@@ -14,3 +14,4 @@ class AlignmentResult:
     transformation_matrix: Optional[Tuple[np.ndarray, np.ndarray]]
     matched_pairs: List[Tuple[Any, Any]]
     clash_results: Optional["ClashResult"] = None
+    isomorphic_match: bool = False

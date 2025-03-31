@@ -1,0 +1,7 @@
+{
+  "input_xtc": "test_data/batch_test/md_sample/300K_fit_4000.xtc",
+  "timestamp": "2025-03-31T09:00:23.794398",
+  "n_frames": 0,
+  "n_atoms": 0,
+  "conversion_version": "1.0"
+}

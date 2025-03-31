@@ -191,112 +191,132 @@ def process_compound_directory(
     output_dir.mkdir(exist_ok=True)
 
     # Initialize services
-    service = AlignmentService()
+    from ..core.domain.implementations.breadth_first_isomorphism_superimposer import (
+        BreadthFirstIsomorphismSuperimposer,
+    )
 
-    # Load reference structure
+    service = AlignmentService(superimposer=BreadthFirstIsomorphismSuperimposer())
+
     try:
+        # Load reference structure
         ref_universe = mda.Universe(str(reference_path))
         reference = create_molecular_graph(ref_universe, chain_id=reference_chain)
         logging.info(f"Loaded reference structure with {len(reference.atoms)} atoms")
-    except Exception as e:
-        raise ValueError(
-            f"Could not load reference structure: {reference_path} - {str(e)}"
-        )
 
-    # Load compound structure
-    compound_pdb = compound_dir / "md_Ref.pdb"
-    try:
+        # Load compound structure
+        compound_pdb = compound_dir / "md_Ref.pdb"
         compound_universe = mda.Universe(str(compound_pdb))
         logging.info(
             f"Loaded compound structure with {len(compound_universe.atoms)} atoms"
         )
-    except Exception as e:
-        raise ValueError(
-            f"Could not load compound structure: {compound_pdb} - {str(e)}"
-        )
+        logging.info(f"Found {len(compound_universe.trajectory)} models")
 
-    # Process each frame
-    results = []
-    for frame_idx in range(len(compound_universe.trajectory)):
-        try:
-            # Create MolecularGraph for this frame
-            frame = create_molecular_graph(compound_universe, frame_idx=frame_idx)
-            logging.info(
-                f"Processing frame {frame_idx + 1} with {len(frame.atoms)} atoms"
-            )
+        # Process each model
+        results = []
+        for model_idx in tqdm(
+            range(len(compound_universe.trajectory)),
+            desc="Processing models",
+            disable=not verbose,
+        ):
+            try:
+                # Create MolecularGraph for this model
+                model = create_molecular_graph(compound_universe, frame_idx=model_idx)
+                logging.info(
+                    f"Processing model {model_idx + 1} with {len(model.atoms)} atoms"
+                )
 
-            # Align structures
-            result = service.align_structures(
-                reference=reference,
-                target=frame,
-                clash_cutoff=clash_cutoff,
-            )
-            logging.info(f"Aligned frame {frame_idx + 1} with RMSD {result.rmsd:.3f} Å")
+                # Align structures
+                result = service.align_structures(
+                    reference=reference,
+                    target=model,
+                    clash_cutoff=clash_cutoff,
+                )
+                logging.info(
+                    f"Aligned model {model_idx + 1} with RMSD {result.rmsd:.3f} Å, "
+                    f"matched {result.matched_atoms} atoms"
+                )
 
-            # Check for clashes with target chains if specified
-            if target_chains:
-                clash_results = []
-                for chain in target_chains:
-                    try:
-                        target_chain = create_molecular_graph(
-                            ref_universe, chain_id=chain
-                        )
-                        clash_result = service._detect_clashes(
-                            reference=target_chain,
-                            target=frame,
-                            alignment=result,
-                            cutoff=clash_cutoff,
-                        )
-                        clash_results.append(clash_result)
-                        logging.info(
-                            f"Checked clashes with chain {chain}: {clash_result.num_clashes} clashes found"
-                        )
-                    except Exception as e:
-                        logging.error(
-                            f"Error checking clashes with chain {chain}: {str(e)}"
-                        )
-                        continue
-
-                # Combine clash results
-                total_clashes = sum(r.num_clashes for r in clash_results)
-                min_distance = min(r.min_distance for r in clash_results)
-                has_clashes = any(r.has_clashes for r in clash_results)
-            else:
+                # Check for clashes with target chains if specified
                 total_clashes = 0
                 min_distance = float("inf")
                 has_clashes = False
 
-            # Save aligned structure
-            output_pdb = output_dir / f"frame_{frame_idx + 1}_aligned.pdb"
-            save_aligned_structure(
-                frame,
-                result.transformation_matrix,
-                str(output_pdb),
+                if target_chains:
+                    clash_results = []
+                    for chain in target_chains:
+                        try:
+                            target_chain = create_molecular_graph(
+                                ref_universe, chain_id=chain
+                            )
+                            clash_result = service._detect_clashes(
+                                reference=target_chain,
+                                target=model,
+                                alignment=result,
+                                cutoff=clash_cutoff,
+                            )
+                            clash_results.append(clash_result)
+                            logging.info(
+                                f"Checked clashes with chain {chain}: "
+                                f"{clash_result.num_clashes} clashes found"
+                            )
+                        except Exception as e:
+                            logging.error(
+                                f"Error checking clashes with chain {chain}: {str(e)}"
+                            )
+                            continue
+
+                    # Combine clash results
+                    total_clashes = sum(r.num_clashes for r in clash_results)
+                    min_distance = min(r.min_distance for r in clash_results)
+                    has_clashes = any(r.has_clashes for r in clash_results)
+
+                # Save aligned structure if alignment was successful
+                if result.transformation_matrix is not None:
+                    output_pdb = output_dir / f"model_{model_idx + 1}_aligned.pdb"
+                    save_aligned_structure(
+                        model,
+                        result.transformation_matrix,
+                        str(output_pdb),
+                    )
+                    logging.info(f"Saved aligned structure to {output_pdb}")
+
+                # Collect metrics
+                metrics = {
+                    "Model": model_idx + 1,
+                    "RMSD": result.rmsd,
+                    "Matched_Atoms": result.matched_atoms,
+                    "Has_Clashes": has_clashes,
+                    "Num_Clashes": total_clashes,
+                    "Min_Distance": min_distance,
+                    "Isomorphic_Match": (
+                        result.isomorphic_match
+                        if hasattr(result, "isomorphic_match")
+                        else False
+                    ),
+                    "Atom_Mapping": (
+                        str(result.matched_pairs) if result.matched_pairs else ""
+                    ),
+                }
+                results.append(metrics)
+
+            except Exception as e:
+                logging.error(f"Error processing model {model_idx + 1}: {str(e)}")
+                continue
+
+        # Save metrics to CSV
+        if results:
+            metrics_df = pd.DataFrame(results)
+            metrics_df.to_csv(output_dir / "alignment_metrics.csv", index=False)
+            logging.info(
+                f"Saved metrics for {len(results)} models to "
+                f"{output_dir / 'alignment_metrics.csv'}"
             )
-            logging.info(f"Saved aligned structure to {output_pdb}")
+        else:
+            logging.warning("No results to save")
 
-            # Collect metrics
-            metrics = {
-                "Frame": frame_idx + 1,
-                "RMSD": result.rmsd,
-                "Matched_Atoms": result.matched_atoms,
-                "Has_Clashes": has_clashes,
-                "Num_Clashes": total_clashes,
-                "Min_Distance": min_distance,
-            }
-            results.append(metrics)
-
-        except Exception as e:
-            logging.error(f"Error processing frame {frame_idx + 1}: {str(e)}")
-            continue
-
-    # Save metrics to CSV
-    if results:
-        metrics_df = pd.DataFrame(results)
-        metrics_df.to_csv(output_dir / "alignment_metrics.csv", index=False)
-        logging.info(f"Saved metrics to {output_dir / 'alignment_metrics.csv'}")
-    else:
-        logging.warning("No results to save")
+    except Exception as e:
+        logging.error(f"Error processing compound directory {compound_dir}: {str(e)}")
+        raise
 
 
 def save_aligned_structure(
