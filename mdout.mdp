@@ -1,8 +1,8 @@
 ;
 ;	File 'mdout.mdp' was generated
 ;	By user: root (501)
-;	On host: eduroam-169-233-246-91.ucsc.edu
-;	At date: Mon Mar 31 09:05:17 2025
+;	On host: eduroam-169-233-254-64.ucsc.edu
+;	At date: Mon Mar 31 16:56:51 2025
 ;
 ;	Created by:
 ;	                :-) GROMACS - gmx grompp, 2025.1-Homebrew (-:
@@ -11,7 +11,7 @@
 ;	Data prefix:  /opt/homebrew/bin/../Cellar/gromacs/2025.1
 ;	Working dir:  /Users/Adam/Conformacophore
 ;	Command line:
-;	  gmx grompp -f /var/folders/hz/p_sjdyn93vld_yhd5fkykt480000gn/T/traj_convert_mosigvwl/temp.mdp -c /var/folders/hz/p_sjdyn93vld_yhd5fkykt480000gn/T/traj_convert_mosigvwl/conf.gro -p /var/folders/hz/p_sjdyn93vld_yhd5fkykt480000gn/T/traj_convert_mosigvwl/topol.top -o /var/folders/hz/p_sjdyn93vld_yhd5fkykt480000gn/T/traj_convert_mosigvwl/temp.tpr -maxwarn 100
+;	  gmx grompp -f /var/folders/hz/p_sjdyn93vld_yhd5fkykt480000gn/T/traj_convert_rvommcjl/temp.mdp -c /var/folders/hz/p_sjdyn93vld_yhd5fkykt480000gn/T/traj_convert_rvommcjl/conf.gro -p /var/folders/hz/p_sjdyn93vld_yhd5fkykt480000gn/T/traj_convert_rvommcjl/topol.top -o /var/folders/hz/p_sjdyn93vld_yhd5fkykt480000gn/T/traj_convert_rvommcjl/temp.tpr -maxwarn 100
 
 ; VARIOUS PREPROCESSING OPTIONS
 ; Preprocessor information: use cpp syntax.
@@ -175,7 +175,7 @@ annealing-temp           =
 ; GENERATE VELOCITIES FOR STARTUP RUN
 gen-vel                  = no
 gen-temp                 = 300
-gen-seed                 = -23103115
+gen-seed                 = -4726865
 
 ; OPTIONS FOR BONDS    
 constraints              = none

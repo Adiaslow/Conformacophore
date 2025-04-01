@@ -142,16 +142,18 @@ def create_temp_dir() -> Path:
     return temp_dir
 
 
-def process_trajectory(args: Tuple[str, str, str, str, bool]) -> Optional[str]:
+def process_trajectory(
+    args: Tuple[str, str, str, str, bool, Optional[int], Optional[int], Optional[int]],
+) -> Optional[str]:
     """Process a single trajectory file.
 
     Args:
-        args: Tuple containing (xtc_path, topology_path, top_path, output_base, verbose)
+        args: Tuple containing (xtc_path, topology_path, top_path, output_base, verbose, start, stop, stride)
 
     Returns:
         Optional error message if processing failed, None if successful
     """
-    xtc_path, topology_path, top_path, output_base, verbose = args
+    xtc_path, topology_path, top_path, output_base, verbose, start, stop, stride = args
 
     # Skip macOS hidden files
     if os.path.basename(xtc_path).startswith("._"):
@@ -186,15 +188,20 @@ def process_trajectory(args: Tuple[str, str, str, str, bool]) -> Optional[str]:
                 n_atoms=n_atoms,
             )
 
+            # Apply frame selection parameters
+            start_frame = 0 if start is None else start
+            end_frame = None if stop is None else stop
+            stride_value = 1 if stride is None else stride
+
             # Convert trajectory
             output_files = converter.convert_trajectory(
                 xtc_path=xtc_path,
                 gro_path=topology_path,
                 top_path=top_path,
                 output_dir=str(output_dir),
-                start=0,
-                end=None,
-                stride=1,
+                start=start_frame,
+                end=end_frame,
+                stride=stride_value,
             )
 
             return None
@@ -235,6 +242,25 @@ def main():
     )
     parser.add_argument(
         "--verbose", action="store_true", help="Show detailed processing information"
+    )
+    # Add trajectory frame selection parameters
+    parser.add_argument(
+        "--start",
+        type=int,
+        default=None,
+        help="Starting frame index (0-indexed, inclusive)",
+    )
+    parser.add_argument(
+        "--stop",
+        type=int,
+        default=None,
+        help="Ending frame index (exclusive)",
+    )
+    parser.add_argument(
+        "--stride",
+        type=int,
+        default=None,
+        help="Step size for selecting frames",
     )
 
     args = parser.parse_args()
@@ -316,7 +342,9 @@ def main():
                 ):
                     pbar.update(1)
                     continue
-                futures.append(executor.submit(process_trajectory, traj_set))
+                # Add start, stop, stride to the arguments tuple
+                traj_args = traj_set + (args.start, args.stop, args.stride)
+                futures.append(executor.submit(process_trajectory, traj_args))
 
             # Process results as they complete
             errors = []
