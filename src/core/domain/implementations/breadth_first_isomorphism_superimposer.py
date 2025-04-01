@@ -2,7 +2,7 @@
 
 import numpy as np
 import networkx as nx
-from typing import List, Tuple, Optional, Dict, Set
+from typing import List, Tuple, Optional, Dict, Set, Any
 from ..interfaces.structure_superimposer import StructureSuperimposer
 from ..models.molecular_graph import MolecularGraph
 from ..models.alignment_result import AlignmentResult
@@ -14,6 +14,8 @@ class BreadthFirstIsomorphismSuperimposer(StructureSuperimposer):
     def __init__(self, max_iterations: int = 1000):
         """Initialize superimposer."""
         self.max_iterations = max_iterations
+        self._reference_graph = None
+        self._reference_molecular_graph = None
 
     def _create_networkx_graph(self, graph: MolecularGraph) -> nx.Graph:
         """Convert MolecularGraph to NetworkX graph."""
@@ -49,11 +51,22 @@ class BreadthFirstIsomorphismSuperimposer(StructureSuperimposer):
                 ref_graph, target_graph, node_match=node_match
             )
             if matcher.is_isomorphic():
-                return matcher.mapping
+                mapping = dict(matcher.mapping)
+                return mapping
         except Exception:
             pass
 
         return None
+
+    def set_reference(self, reference: MolecularGraph) -> None:
+        """
+        Set a reference structure that will be cached for future alignments.
+
+        Args:
+            reference: Reference molecular graph to cache
+        """
+        self._reference_molecular_graph = reference
+        self._reference_graph = self._create_networkx_graph(reference)
 
     def _calculate_transformation(
         self, ref_coords: np.ndarray, target_coords: np.ndarray
@@ -85,22 +98,30 @@ class BreadthFirstIsomorphismSuperimposer(StructureSuperimposer):
 
         return rotation, translation
 
-    def align(
-        self, reference: MolecularGraph, target: MolecularGraph
-    ) -> AlignmentResult:
+    def align(self, mol1: MolecularGraph, mol2: MolecularGraph) -> AlignmentResult:
         """
         Align target structure to reference using isomorphic graph matching.
 
         Args:
-            reference: Reference structure
-            target: Structure to align
+            mol1: Reference structure
+            mol2: Structure to align
 
         Returns:
             AlignmentResult containing alignment metrics and transformation
         """
-        # Convert to NetworkX graphs
-        ref_graph = self._create_networkx_graph(reference)
-        target_graph = self._create_networkx_graph(target)
+        # Use cached reference if it's the same object or if explicitly provided
+        if (
+            mol1 is self._reference_molecular_graph
+            and self._reference_graph is not None
+        ):
+            ref_graph = self._reference_graph
+        else:
+            # If a new reference is provided, update the cache
+            self.set_reference(mol1)
+            ref_graph = self._reference_graph
+
+        # Convert target to NetworkX graph
+        target_graph = self._create_networkx_graph(mol2)
 
         # Find isomorphic mapping
         mapping = self._find_isomorphic_mapping(ref_graph, target_graph)
@@ -121,12 +142,8 @@ class BreadthFirstIsomorphismSuperimposer(StructureSuperimposer):
         ]
 
         # Get coordinates for matched atoms
-        ref_coords = np.array(
-            [reference.atoms[i].coordinates for i, _ in matched_pairs]
-        )
-        target_coords = np.array(
-            [target.atoms[j].coordinates for _, j in matched_pairs]
-        )
+        ref_coords = np.array([mol1.atoms[i].coordinates for i, _ in matched_pairs])
+        target_coords = np.array([mol2.atoms[j].coordinates for _, j in matched_pairs])
 
         # Calculate optimal transformation
         rotation, translation = self._calculate_transformation(

@@ -29,6 +29,16 @@ from Bio.PDB.Chain import Chain
 from Bio.PDB.NeighborSearch import NeighborSearch
 from Bio.PDB.Selection import unfold_entities
 
+# Cache for reference data to avoid reprocessing
+_REFERENCE_DATA = {
+    "ref_ligand_atoms": None,
+    "ref_protein": None,
+    "ref_ligand": None,
+    "ref_conect_dict": None,
+    "ref_graph": None,
+    "superimposer": None,
+}
+
 
 class ChainSelect(Select):
     """Class to select specific chains from a PDB structure."""
@@ -961,15 +971,6 @@ def superimpose_model(
     logger.info(f"Reference ligand: {len(reference_ligand_atoms)} atoms")
     logger.info(f"Model: {len(model_atoms)} atoms")
 
-    # Parse CONECT records from reference PDB if provided
-    ref_conect_dict = {}
-    if reference_pdb:
-        logger.info(f"Parsing CONECT records from {reference_pdb}")
-        ref_conect_dict = parse_conect_records(reference_pdb)
-        logger.info(
-            f"Found {len(ref_conect_dict)} atoms with CONECT records in reference"
-        )
-
     # Parse CONECT records from model PDB if provided
     model_conect_dict = {}
     if model_pdb:
@@ -979,15 +980,30 @@ def superimpose_model(
             f"Found {len(model_conect_dict)} atoms with CONECT records in model"
         )
 
-    # Create molecular graphs
-    # For the reference, specify it's chain D (the UNL ligand)
-    ref_graph = MolecularGraph(
-        reference_ligand_atoms,
-        logger,
-        name="REF",
-        conect_dict=ref_conect_dict,
-        chain_id="D",
-    )
+    # Create or reuse molecular graphs
+    if _REFERENCE_DATA["ref_graph"] is None:
+        # Parse CONECT records from reference PDB if provided and not already cached
+        ref_conect_dict = {}
+        if reference_pdb:
+            logger.info(f"Parsing CONECT records from {reference_pdb}")
+            ref_conect_dict = parse_conect_records(reference_pdb)
+            logger.info(
+                f"Found {len(ref_conect_dict)} atoms with CONECT records in reference"
+            )
+            _REFERENCE_DATA["ref_conect_dict"] = ref_conect_dict
+
+        # For the reference, specify it's chain D (the UNL ligand)
+        ref_graph = MolecularGraph(
+            reference_ligand_atoms,
+            logger,
+            name="REF",
+            conect_dict=ref_conect_dict,
+            chain_id="D",
+        )
+        _REFERENCE_DATA["ref_graph"] = ref_graph
+    else:
+        ref_graph = _REFERENCE_DATA["ref_graph"]
+        logger.info("Using cached reference graph")
 
     # For the model, use its CONECT records
     model_graph = MolecularGraph(
@@ -1017,79 +1033,21 @@ def superimpose_model(
     # Perform alignment
     logger.info("Starting alignment...")
 
-    # Create a new superimposer instance
-    custom_superimposer = IsomorphicSuperimposer(logger)
+    # Create or reuse superimposer instance
+    if _REFERENCE_DATA["superimposer"] is None:
+        # Create a new superimposer instance
+        custom_superimposer = IsomorphicSuperimposer(logger)
+        _REFERENCE_DATA["superimposer"] = custom_superimposer
+    else:
+        custom_superimposer = _REFERENCE_DATA["superimposer"]
+
     result = custom_superimposer.align(ref_graph, model_graph)
 
+    # Return the desired values
     if result.transformation_matrix is not None:
         rotation, translation = result.transformation_matrix
-        logger.info(
-            f"Alignment successful: RMSD={result.rmsd:.4f}, {result.matched_atoms} atoms matched"
-        )
         return rotation, translation, result.rmsd, result.matched_atoms
     else:
-        logger.warning("Failed to find isomorphic matching between structures")
-
-        # Detailed diagnostics for debugging
-        logger.error("MATCHING FAILURE DIAGNOSTICS:")
-        logger.error("----------------------------")
-
-        # Check for identical elements
-        ref_element_counts = {}
-        model_element_counts = {}
-
-        for n in ref_graph.graph.nodes:
-            el = ref_graph.graph.nodes[n]["element"]
-            if el not in ref_element_counts:
-                ref_element_counts[el] = 0
-            ref_element_counts[el] += 1
-
-        for n in model_graph.graph.nodes:
-            el = model_graph.graph.nodes[n]["element"]
-            if el not in model_element_counts:
-                model_element_counts[el] = 0
-            model_element_counts[el] += 1
-
-        logger.error(f"Reference element counts: {ref_element_counts}")
-        logger.error(f"Model element counts: {model_element_counts}")
-
-        # Compare graph metrics
-        logger.error(
-            f"Reference graph: {len(ref_graph.graph.nodes)} nodes, {len(ref_graph.graph.edges)} edges"
-        )
-        logger.error(
-            f"Model graph: {len(model_graph.graph.nodes)} nodes, {len(model_graph.graph.edges)} edges"
-        )
-
-        # Look for potential subgraph
-        ref_is_subgraph = True
-        for el, count in ref_element_counts.items():
-            if el not in model_element_counts or model_element_counts[el] < count:
-                ref_is_subgraph = False
-                logger.error(
-                    f"Element mismatch: {el} has {count} in ref but {model_element_counts.get(el, 0)} in model"
-                )
-
-        if ref_is_subgraph:
-            logger.error(
-                "Reference COULD BE a subgraph of model based on element counts"
-            )
-        else:
-            logger.error(
-                "Reference is definitely NOT a subgraph of model based on element counts"
-            )
-
-        # Print some sample atoms from both graphs
-        logger.error("Sample reference atoms:")
-        for i, atom in enumerate(reference_ligand_atoms[:5]):
-            residue = atom.get_parent()
-            logger.error(f"  {i}: {atom.name} {atom.element} {residue.resname}")
-
-        logger.error("Sample model atoms:")
-        for i, atom in enumerate(model_atoms[:5]):
-            residue = atom.get_parent()
-            logger.error(f"  {i}: {atom.name} {atom.element} {residue.resname}")
-
         return None, None, float("inf"), 0
 
 
@@ -1146,69 +1104,96 @@ def superimpose_trajectory(
     """Superimpose a trajectory to the reference structure."""
     pdb_path, reference_pdb, output_dir, verbose, start, stop, stride, force = args
 
-    # Set up logging
-    logger = setup_logging(verbose)
+    # Configure logging based on verbosity
+    log_level = logging.INFO if verbose else logging.WARNING
+    if verbose == "debug":
+        log_level = logging.DEBUG
+    logger = logging.getLogger(f"superimpose_{Path(pdb_path).stem}")
+    logger.setLevel(log_level)
+
+    # Configure file handler
+    logs_dir = Path(output_dir) / "logs"
+    logs_dir.mkdir(exist_ok=True)
+    file_handler = logging.FileHandler(
+        logs_dir / f"{Path(pdb_path).stem}_superimpose.log", mode="w"
+    )
+    file_handler.setLevel(log_level)
+    formatter = logging.Formatter(
+        "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+    )
+    file_handler.setFormatter(formatter)
+    logger.addHandler(file_handler)
+
+    # Also add console handler for visual feedback
+    console_handler = logging.StreamHandler()
+    console_handler.setLevel(log_level)
+    logger.addHandler(console_handler)
+
+    # Check if files exist
+    if not os.path.exists(pdb_path):
+        logger.error(f"PDB file not found: {pdb_path}")
+        return None
+    if not os.path.exists(reference_pdb):
+        logger.error(f"Reference PDB file not found: {reference_pdb}")
+        return None
+
+    # Create output directory structure
+    output_path = Path(output_dir)
+    output_path.mkdir(exist_ok=True)
+
+    # Generate output file name
+    rel_path = Path(pdb_path).relative_to(Path(pdb_path).parent.parent)
+    output_file = output_path / f"{rel_path.stem}_superimposed.pdb"
+    rmsd_file = output_path / f"{rel_path.stem}_rmsd.json"
+
+    # Check if already processed
+    if not force and output_file.exists() and rmsd_file.exists():
+        logger.info(f"Skipping already processed file: {pdb_path}")
+        return str(pdb_path), {}
 
     try:
-        pdb_file = Path(pdb_path)
-        output_dir_path = Path(output_dir)
-        output_dir_path.mkdir(parents=True, exist_ok=True)
-
-        # Output file will be in the same directory structure but in the output dir
-        rel_path = pdb_file.relative_to(pdb_file.parent.parent)
-        output_file = output_dir_path / f"{rel_path.stem}_superimposed.pdb"
-        output_file.parent.mkdir(parents=True, exist_ok=True)
-
-        # Check if already processed
-        rmsd_file = output_file.parent / f"{rel_path.stem}_rmsd.json"
-        if (
-            not force
-            and output_file.exists()
-            and rmsd_file.exists()
-            and not isinstance(verbose, str)
-            and not verbose
-        ):
-            logger.info(f"Skipping {pdb_file}, already processed")
-            return None
-
-        if force and output_file.exists():
-            logger.info(f"Force flag set, reprocessing {pdb_file}")
-
-        # Parse CONECT records from the test PDB file
-        test_conect_dict = parse_conect_records(str(pdb_file))
-        logger.info(
-            f"Found {len(test_conect_dict)} atoms with CONECT records in test PDB"
-        )
-
         with tempfile.TemporaryDirectory(prefix="superimpose_") as temp_dir_str:
             temp_dir = Path(temp_dir_str)
 
-            # Extract reference ligand (chain D)
-            ref_ligand_file = extract_chain_from_reference(
-                reference_pdb, ["D"], temp_dir / "reference_ligand.pdb", logger
-            )
+            # Initialize reference data if not already done
+            if _REFERENCE_DATA["ref_ligand_atoms"] is None:
+                # Extract reference ligand (chain D)
+                ref_ligand_file = extract_chain_from_reference(
+                    reference_pdb, ["D"], temp_dir / "reference_ligand.pdb", logger
+                )
 
-            # Extract reference protein (chains A, B, C)
-            ref_protein_file = extract_chain_from_reference(
-                reference_pdb,
-                ["A", "B", "C"],
-                temp_dir / "reference_protein.pdb",
-                logger,
-            )
+                # Extract reference protein (chains A, B, C)
+                ref_protein_file = extract_chain_from_reference(
+                    reference_pdb,
+                    ["A", "B", "C"],
+                    temp_dir / "reference_protein.pdb",
+                    logger,
+                )
 
-            # Load reference structures
-            parser = PDBParser(QUIET=True)
-            ref_ligand = parser.get_structure("ref_ligand", str(ref_ligand_file))
-            ref_protein = parser.get_structure("ref_protein", str(ref_protein_file))
+                # Load reference structures
+                parser = PDBParser(QUIET=True)
+                ref_ligand = parser.get_structure("ref_ligand", str(ref_ligand_file))
+                ref_protein = parser.get_structure("ref_protein", str(ref_protein_file))
 
-            # Get reference ligand atoms for superimposition
-            ref_ligand_atoms = list(unfold_entities(ref_ligand[0]["D"], "A"))
+                # Get reference ligand atoms for superimposition
+                ref_ligand_atoms = list(unfold_entities(ref_ligand[0]["D"], "A"))
 
-            if not ref_ligand_atoms:
-                logger.error("No atoms found in reference ligand")
-                return None
+                if not ref_ligand_atoms:
+                    logger.error("No atoms found in reference ligand")
+                    return None
 
-            logger.info(f"Reference ligand has {len(ref_ligand_atoms)} atoms")
+                logger.info(f"Reference ligand has {len(ref_ligand_atoms)} atoms")
+
+                # Cache reference data
+                _REFERENCE_DATA["ref_ligand_atoms"] = ref_ligand_atoms
+                _REFERENCE_DATA["ref_protein"] = ref_protein
+                _REFERENCE_DATA["ref_ligand"] = ref_ligand
+            else:
+                # Use cached reference data
+                ref_ligand_atoms = _REFERENCE_DATA["ref_ligand_atoms"]
+                ref_protein = _REFERENCE_DATA["ref_protein"]
+                ref_ligand = _REFERENCE_DATA["ref_ligand"]
+                logger.info("Using cached reference data")
 
             # Count models in trajectory
             model_count = count_models_in_pdb(pdb_path)
@@ -1325,7 +1310,7 @@ def superimpose_trajectory(
                         f"No CONECT records found in model extraction, trying to parse from original file"
                     )
                     # Parse CONECT records specifically for this model number
-                    model_conect_dict = parse_conect_records(str(pdb_file), model_idx)
+                    model_conect_dict = parse_conect_records(str(pdb_path), model_idx)
                     if model_conect_dict:
                         logger.info(
                             f"Successfully parsed {len(model_conect_dict)} CONECT records from original file for model {model_idx}"
@@ -1335,7 +1320,7 @@ def superimpose_trajectory(
                             f"Could not find CONECT records in original file for model {model_idx}"
                         )
                         # Try parsing all CONECT records as fallback
-                        model_conect_dict = parse_conect_records(str(pdb_file))
+                        model_conect_dict = parse_conect_records(str(pdb_path))
                         if model_conect_dict:
                             logger.info(
                                 f"Parsed {len(model_conect_dict)} CONECT records from entire file"
@@ -1366,7 +1351,7 @@ def superimpose_trajectory(
                         model_atoms,
                         logger,
                         reference_pdb=reference_pdb,
-                        model_pdb=str(pdb_file),
+                        model_pdb=str(pdb_path),
                     )
                 except Exception as e:
                     logger.error(
@@ -1561,7 +1546,7 @@ def main():
     parser.add_argument(
         "--num-processes",
         type=int,
-        default=4,
+        default=1,  # Default to 1 process to enable caching
         help="Number of parallel processes to use",
     )
     parser.add_argument(
@@ -1594,6 +1579,12 @@ def main():
         default=None,
         help="Step size for selecting models",
     )
+    # New option to enable multi-processing (which disables caching)
+    parser.add_argument(
+        "--multi-process",
+        action="store_true",
+        help="Enable parallel processing (disables reference data caching)",
+    )
 
     args = parser.parse_args()
 
@@ -1623,6 +1614,16 @@ def main():
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    # Set number of processes based on args
+    num_processes = args.num_processes
+    if args.multi_process:
+        logger.info(
+            f"Using multi-processing with {num_processes} processes (reference data caching disabled)"
+        )
+    else:
+        num_processes = 1
+        logger.info("Using single process to enable reference data caching")
+
     # Try processing single-threaded first if debugging
     if args.debug:
         logger.info("Running in debug mode with single thread")
@@ -1649,7 +1650,7 @@ def main():
 
     # Process files in parallel for normal mode
     with tqdm(total=len(pdb_files), unit="file") as pbar:
-        with ProcessPoolExecutor(max_workers=args.num_processes) as executor:
+        with ProcessPoolExecutor(max_workers=num_processes) as executor:
             futures = []
 
             for pdb_file in pdb_files:
