@@ -2,9 +2,18 @@
 # src/scripts/superimpose_trajectories.py
 
 """
-Script to superimpose converted molecular dynamics trajectories to a reference structure.
-Uses the BreadthFirstIsomorphismSuperimposer to align ligand structures.
-Based on the original implementation in old_scripts/breadth_first_isomorphism_superimposer.py.
+Script to superimpose test compound conformations onto a reference ligand structure.
+
+The script handles two main types of structures:
+1. Reference Structure:
+   - Contains protein chains (A,B,C) and a reference ligand (chain D)
+   - Used as the template for superimposition
+   - Chain D contains the reference ligand conformation
+
+2. Test Compound Models:
+   - Contains conformations of test compounds from MD trajectories
+   - Each model represents a different conformation to be aligned
+   - Compounds are matched to the reference ligand using graph isomorphism
 """
 
 import os
@@ -13,56 +22,111 @@ import logging
 import tempfile
 import json
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Any
+from typing import (
+    Dict,
+    List,
+    Optional,
+    Tuple,
+    Any,
+    Set,
+    Literal,
+    Union,
+    Generator,
+    TypeVar,
+    cast,
+)
 import numpy as np
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from tqdm import tqdm
 import networkx as nx
-
-# BioPython for PDB handling
+import functools
 from Bio.PDB.PDBParser import PDBParser
 from Bio.PDB.PDBIO import PDBIO, Select
 from Bio.PDB.Superimposer import Superimposer
 from Bio.PDB.Structure import Structure
 from Bio.PDB.Model import Model
 from Bio.PDB.Chain import Chain
-from Bio.PDB.NeighborSearch import NeighborSearch
-from Bio.PDB.Selection import unfold_entities
+from Bio.PDB.Atom import Atom
+from Bio.PDB.Residue import Residue
+import rdkit
+from rdkit import Chem
+from rdkit.Chem import AllChem
+from rdkit.Chem.rdFMCS import FindMCS
+from numpy.typing import NDArray
 
-# Cache for reference data to avoid reprocessing
-_REFERENCE_DATA = {
-    "ref_ligand_atoms": None,
-    "ref_protein": None,
-    "ref_ligand": None,
-    "ref_conect_dict": None,
-    "ref_graph": None,
-    "superimposer": None,
+# Global cache for reference data
+_REFERENCE_DATA: Dict[str, Any] = {
+    "target_protein_coords": None,  # Nx3 numpy array of protein atom coordinates
+    "ref_ligand_graph": None,  # MolecularGraph object for reference ligand
+    "ref_ligand_coords": None,  # Mx3 numpy array of ligand atom coordinates
+    "ref_conect": None,  # CONECT records for the reference ligand
 }
+
+# Add a cache for isomorphic mappings
+_ISOMORPHIC_CACHE: Dict[str, Dict[str, Any]] = {}
+
+# File cache to avoid re-reading the same files
+_FILE_CACHE = {}
+_PDB_STRUCTURE_CACHE: Dict[str, Structure] = {}
+_CONECT_CACHE = {}
+
+# Initialize PDB parser once
+PDB_PARSER = PDBParser(QUIET=True)
+
+# Type variables for graph attributes
+NodeData = TypeVar("NodeData", bound=Dict[str, Any])
 
 
 class ChainSelect(Select):
-    """Class to select specific chains from a PDB structure."""
+    """Select specific chains when saving a structure."""
 
-    def __init__(self, chain_ids):
-        """Initialize with chain IDs to keep."""
+    def __init__(self, chain_ids: List[str]):
+        """Initialize chain selector.
+
+        Args:
+            chain_ids: List of chain IDs to select
+        """
+        super().__init__()
         self.chain_ids = chain_ids
 
-    def accept_chain(self, chain):
-        """Accept only specified chains."""
-        # Return 1 instead of bool to match Bio.PDB.Select API
-        return 1 if chain.id in self.chain_ids else 0
+    def accept_chain(self, chain: Chain) -> Literal[1]:
+        """Determine if a chain should be included.
+
+        Args:
+            chain: BioPython Chain object
+
+        Returns:
+            1 if chain should be included, 0 if not
+
+        Note:
+            BioPython's Select class expects integer return values:
+            1 to accept the chain, 0 to reject it
+        """
+        if chain.id in self.chain_ids:
+            return 1
+        return super().accept_chain(chain)
 
 
 class AlignmentResult:
-    """Contains results from molecular structure alignment."""
+    """Result of an alignment operation."""
 
     def __init__(
         self,
         rmsd: float,
         matched_atoms: int,
-        transformation_matrix: Optional[Tuple[np.ndarray, np.ndarray]],
-        matched_pairs: List,
-    ):
+        transformation_matrix: Optional[
+            Tuple[NDArray[np.float64], NDArray[np.float64]]
+        ],
+        matched_pairs: List[Tuple[Any, Any]],
+    ) -> None:
+        """Initialize an AlignmentResult.
+
+        Args:
+            rmsd: Root mean square deviation of the alignment
+            matched_atoms: Number of matched atoms
+            transformation_matrix: Optional tuple of (rotation matrix, translation vector)
+            matched_pairs: List of matched atom pairs
+        """
         self.rmsd = rmsd
         self.matched_atoms = matched_atoms
         self.transformation_matrix = transformation_matrix
@@ -71,273 +135,175 @@ class AlignmentResult:
 
 
 class MolecularGraph:
-    """Represents a molecular structure as a graph."""
+    """Represents a molecular structure as a graph for matching."""
 
     def __init__(
         self,
         atoms: List[Any],
-        logger=None,
-        name="",
-        conect_dict=None,
-        structure=None,
-        chain_id=None,
+        logger: Optional[logging.Logger] = None,
+        name: str = "",
+        conect_dict: Optional[Dict[int, List[int]]] = None,
+        structure: Optional[Structure] = None,
+        chain_id: Optional[str] = None,
+        is_reference: bool = False,
     ):
-        """Initialize molecular graph from list of atoms."""
+        """Initialize molecular graph from list of atoms.
+
+        Args:
+            atoms: List of BioPython atoms
+            logger: Optional logger instance
+            name: Name identifier for the molecule
+            conect_dict: Dictionary of CONECT records from PDB
+            structure: Original structure for reference
+            chain_id: Chain ID to filter CONECT records
+            is_reference: Whether this is the reference ligand (True) or test compound (False)
+        """
         self.atoms = atoms
         self.name = name
         self.logger = logger
-        self.conect_dict = conect_dict  # Dictionary of CONECT records from PDB
-        self.structure = structure  # Original structure for reference
-        self.chain_id = chain_id  # Chain ID to filter CONECT records
+        self.conect_dict = conect_dict
+        self.structure = structure
+        self.chain_id = chain_id
+        self.is_reference = is_reference
+        self.serial_to_atom = {}
         self.graph = self._create_graph()
+
+    def get_coordinates(self) -> np.ndarray:
+        """Get coordinates of all atoms in the graph.
+
+        Returns:
+            numpy array of shape (n_atoms, 3) containing xyz coordinates
+        """
+        return np.array([atom.coord for atom in self.atoms])
 
     def _create_graph(self) -> nx.Graph:
         """Create NetworkX graph from atoms using PDB connectivity."""
         G = nx.Graph()
 
         # Create a map from atom serial number to atom object
-        serial_to_atom = {}
+        serial_to_atom: Dict[int, Atom] = {}
+        name_to_atom: Dict[str, Atom] = {}  # Also map by atom name
+        serial_numbers: List[int] = []  # Track all serials for debugging
+
         for atom in self.atoms:
             serial_to_atom[atom.serial_number] = atom
+            serial_numbers.append(atom.serial_number)
+
+            # Map by name (format: "N1", "C1", etc.)
+            name_to_atom[atom.name.strip()] = atom
 
             # The atom may have a property with its original serial number
             if hasattr(atom, "original_serial"):
-                serial_to_atom[atom.original_serial] = atom
+                original_serial = getattr(atom, "original_serial")
+                serial_to_atom[original_serial] = atom
+                serial_numbers.append(original_serial)
+                if self.logger and self.logger.isEnabledFor(logging.DEBUG):
+                    self.logger.debug(
+                        f"Atom {atom.name} has original serial: {original_serial}"
+                    )
+
+        # Store for use in other methods
+        self.serial_to_atom = serial_to_atom
 
         # Log the serial numbers we have
         if self.logger:
             self.logger.debug(
-                f"{self.name} Atom serial numbers: {sorted(serial_to_atom.keys())}"
+                f"{self.name} Atom serial numbers: {sorted(serial_numbers)}"
             )
 
         # Add nodes with attributes
         for i, atom in enumerate(self.atoms):
             residue = atom.get_parent()
-            node_attrs = {
-                "name": atom.name,
-                "element": atom.element.strip(),  # Strip whitespace
+            residue_name, residue_id = self._get_residue_info(residue)
+            element = self._get_atom_element(atom)
+
+            node_attrs: Dict[str, Any] = {
+                "name": atom.name.strip(),  # Strip whitespace
+                "element": element,
                 "coord": tuple(atom.coord),
-                "residue_name": residue.resname,
-                "residue_id": residue.id,
+                "residue_name": residue_name,
+                "residue_id": residue_id,
                 "idx": i,  # Keep track of original index
                 "serial": atom.serial_number,  # Keep track of PDB serial number
             }
+
+            # Store original serial number if available
+            if hasattr(atom, "original_serial"):
+                node_attrs["original_serial"] = getattr(atom, "original_serial")
+
             G.add_node(atom, **node_attrs)
 
-            if self.logger:
+            if self.logger and self.logger.isEnabledFor(logging.DEBUG):
+                serial_info = (
+                    f", original: {getattr(atom, 'original_serial')}"
+                    if hasattr(atom, "original_serial")
+                    else ""
+                )
                 self.logger.debug(
-                    f"{self.name} Node {i}: {atom.name} {atom.element} {residue.resname} {residue.id} (serial: {atom.serial_number})"
+                    f"{self.name} Node {i}: {atom.name} {element} {residue_name} {residue_id} (serial: {atom.serial_number}{serial_info})"
                 )
 
-        # If we have CONECT records, try to use them directly first
-        if self.conect_dict and self.name == "REF":
+        # Check if we have CONECT records
+        if not self.conect_dict:
+            error_msg = f"{self.name} ERROR: No CONECT records found for this structure. CONECT records are required."
             if self.logger:
-                self.logger.info(
-                    f"{self.name} Trying to use CONECT records for UNL ligand"
-                )
+                self.logger.error(error_msg)
+            raise ValueError(error_msg)
 
-            edge_count = 0
-            # Try all possible combinations by directly matching the atom names
-            atom_lookup = {}
-            for atom in self.atoms:
-                atom_lookup[atom.name] = atom
+        # Add edges using CONECT records - this is the only supported connectivity method
+        edge_count = self._add_conect_edges(G)
 
-            # UNL connectivity from CONECT records - we know the serial numbers start at 1 for the UNL ligand
-            unl_connectivity = {
-                "N1": ["C1"],  # 1 connects to 2
-                "C1": ["N1", "C2", "O1"],  # 2 connects to 1,3,4
-                "C2": ["C1", "N2", "C5"],  # 3 connects to 2,5,8
-                "O1": ["C1"],  # 4 connects to 2
-                "N2": ["C2", "C3", "C6"],  # 5 connects to 3,6,9
-                "C3": ["N2", "C4"],  # 6 connects to 5,7
-                "C4": ["C3", "C5"],  # 7 connects to 6,8
-                "C5": ["C2", "C4"],  # 8 connects to 3,7
-                "C6": ["N2", "C7", "O3"],  # 9 connects to 5,10,11
-                "C7": ["C6", "N3"],  # 10 connects to 9,12
-                "O3": ["C6"],  # 11 connects to 9
-                "N3": ["C7"],  # 12 connects to 10
-            }
+        # Check if we have enough edges for connectivity
+        if edge_count < 1:
+            error_msg = (
+                f"{self.name} ERROR: Failed to create any edges from CONECT records."
+            )
+            if self.logger:
+                self.logger.error(error_msg)
+            raise ValueError(error_msg)
 
-            # Add edges based on known connectivity
-            for atom_name, connected_names in unl_connectivity.items():
-                if atom_name in atom_lookup:
-                    atom1 = atom_lookup[atom_name]
-                    for connected_name in connected_names:
-                        if connected_name in atom_lookup:
-                            atom2 = atom_lookup[connected_name]
-                            # Only add each edge once (avoid duplicates)
-                            if atom1 != atom2 and not G.has_edge(atom1, atom2):
-                                G.add_edge(atom1, atom2)
-                                edge_count += 1
-                                if self.logger:
-                                    self.logger.debug(
-                                        f"{self.name} Edge from CONECT connectivity: {atom1.name}-{atom2.name}"
-                                    )
+        # Additional validation - ensure the graph is reasonably connected
+        # For test compounds, be more lenient with connectivity requirements
+        min_edges = len(self.atoms) - 1 if self.is_reference else len(self.atoms) - 3
+        if len(G.edges) < min_edges:
+            # Try to infer missing edges based on distance
+            self._infer_missing_edges(G)
 
-            if edge_count > 0:
+            # Check connectivity again
+            if len(G.edges) < min_edges:
+                error_msg = f"{self.name} ERROR: Graph is not fully connected after using CONECT records and distance-based inference. Got {len(G.edges)} edges but need at least {min_edges}."
                 if self.logger:
-                    self.logger.info(
-                        f"{self.name} Successfully added {edge_count} edges from CONECT-based connectivity"
-                    )
-            else:
-                if self.logger:
-                    self.logger.warning(
-                        f"{self.name} Failed to add edges using CONECT-based connectivity, falling back"
-                    )
+                    self.logger.error(error_msg)
+                    # Log detailed connectivity information
+                    self._log_connectivity_info(G)
+                raise ValueError(error_msg)
 
-                # Try the hardcoded connectivity as fallback
-                if self.name == "REF":
-                    if self.logger:
-                        self.logger.info(
-                            f"{self.name} Using standard connectivity for UNL ligand"
-                        )
-
-                    # Define the known connectivity for the UNL ligand
-                    # Based on the PDB file you shared, the connectivity is:
-                    unl_connectivity = {
-                        "N1": ["C1"],
-                        "C1": ["N1", "C2", "O1"],
-                        "C2": ["C1", "N2", "C5"],
-                        "O1": ["C1"],
-                        "N2": ["C2", "C3", "C6"],
-                        "C3": ["N2", "C4"],
-                        "C4": ["C3", "C5"],
-                        "C5": ["C2", "C4"],
-                        "C6": ["N2", "C7", "O3"],
-                        "C7": ["C6", "N3"],
-                        "O3": ["C6"],
-                        "N3": ["C7"],
-                    }
-
-                    # Create a map from atom name to atom object
-                    name_to_atom = {atom.name: atom for atom in self.atoms}
-
-                    # Add edges based on known connectivity
-                    edge_count = 0
-                    for atom_name, connected_names in unl_connectivity.items():
-                        if atom_name in name_to_atom:
-                            atom1 = name_to_atom[atom_name]
-                            for connected_name in connected_names:
-                                if connected_name in name_to_atom:
-                                    atom2 = name_to_atom[connected_name]
-                                    # Only add each edge once (avoid duplicates)
-                                    if atom1 != atom2 and not G.has_edge(atom1, atom2):
-                                        G.add_edge(atom1, atom2)
-                                        edge_count += 1
-                                        if self.logger:
-                                            self.logger.debug(
-                                                f"{self.name} Edge from UNL connectivity: {atom1.name}-{atom2.name}"
-                                            )
-
-        # If we have CONECT records for a standard model, use them
-        elif self.conect_dict:
-            if self.logger:
-                self.logger.info(f"{self.name} Using CONECT records for bonds")
-
-            # Add edges based on CONECT records
-            edge_count = 0
-            for serial, connected_serials in self.conect_dict.items():
-                # Check if this CONECT record is for our chain
-                if serial in serial_to_atom:
-                    atom1 = serial_to_atom[serial]
-                    for connected_serial in connected_serials:
-                        if connected_serial in serial_to_atom:
-                            atom2 = serial_to_atom[connected_serial]
-                            # Only add each edge once (avoid duplicates)
-                            if atom1 != atom2 and not G.has_edge(atom1, atom2):
-                                G.add_edge(atom1, atom2)
-                                edge_count += 1
                                 if self.logger:
-                                    self.logger.debug(
-                                        f"{self.name} Edge from CONECT: {atom1.name}({serial})-{atom2.name}({connected_serial})"
-                                    )
-        else:
-            # Fallback to distance-based bond inference
-            if self.logger:
-                self.logger.info(
-                    f"{self.name} No CONECT records found, inferring bonds by distance"
-                )
-
-            # Find a suitable bond distance cutoff based on the structure
-            if self.name == "REF":
-                # Reference structure often has different coordinate scaling
-                bond_cutoff = (
-                    2.5  # Use a larger cutoff for reference to ensure connectivity
-                )
-            else:
-                bond_cutoff = 2.0  # Standard cutoff for model
-
-            # Add edges based on covalent bonding distances
-            edge_count = 0
-            for atom in self.atoms:
-                coord1 = np.array(atom.coord)
-                element1 = atom.element.strip()
-
-                # Skip hydrogens if needed
-                if element1 == "H":
-                    continue
-
-                # Check all other atoms for bonds
-                for other_atom in self.atoms:
-                    if atom != other_atom:
-                        element2 = other_atom.element.strip()
-
-                        # Skip hydrogens
-                        if element2 == "H":
-                            continue
-
-                        coord2 = np.array(other_atom.coord)
-                        dist = np.linalg.norm(coord1 - coord2)
-
-                        # Adjust cutoff based on atom types
-                        adjusted_cutoff = bond_cutoff
-                        if element1 == "C" and element2 == "C":
-                            adjusted_cutoff = bond_cutoff * 1.0  # C-C: ~1.5 Å
-                        elif (element1 == "C" and element2 == "N") or (
-                            element1 == "N" and element2 == "C"
-                        ):
-                            adjusted_cutoff = bond_cutoff * 1.0  # C-N: ~1.4 Å
-                        elif (element1 == "C" and element2 == "O") or (
-                            element1 == "O" and element2 == "C"
-                        ):
-                            adjusted_cutoff = bond_cutoff * 0.9  # C-O: ~1.4 Å
-                        elif element1 == "N" and element2 == "N":
-                            adjusted_cutoff = bond_cutoff * 1.0  # N-N: ~1.4 Å
-
-                        # Use a distance cutoff appropriate for covalent bonds
-                        if dist < adjusted_cutoff:
-                            G.add_edge(atom, other_atom)
-                            edge_count += 1
-                            if self.logger:
-                                self.logger.debug(
-                                    f"{self.name} Edge by distance: {atom.name}-{other_atom.name} ({dist:.2f} Å)"
-                                )
-
-        if self.logger:
             self.logger.info(
-                f"{self.name} Graph: {len(G.nodes)} nodes, {edge_count} edges"
+                f"{self.name} Graph: {len(G.nodes)} nodes, {len(G.edges)} edges"
             )
 
-            # Print degree distribution
-            degrees = [G.degree[n] for n in G.nodes()]  # Access degree values safely
-            terminal_nodes = [n for n in G.nodes if G.degree[n] == 1]
-            self.logger.info(f"{self.name} Degree distribution: {sorted(degrees)}")
+        # Print degree distribution
+        degrees = {}
+        for node in G.nodes():
+            degrees[node] = len(
+                list(G.neighbors(node))
+            )  # Use neighbors instead of degree
+        terminal_nodes = [n for n in G.nodes if degrees[n] == 1]
+                if self.logger:
+                    self.logger.info(
+                f"{self.name} Degree distribution: {sorted(degrees.values())}"
+            )
             self.logger.info(f"{self.name} Terminal nodes: {len(terminal_nodes)}")
 
             # Print element distribution
-            elements = [G.nodes[n]["element"] for n in G.nodes]
-            element_counts = {}
+            elements = [cast(Dict[str, str], G.nodes[n])["element"] for n in G.nodes]
+            element_counts: Dict[str, int] = {}
             for e in elements:
                 if e not in element_counts:
                     element_counts[e] = 0
                 element_counts[e] += 1
             self.logger.info(f"{self.name} Element distribution: {element_counts}")
-
-            # Print connectivity check
-            if edge_count < len(G.nodes) - 1:
-                self.logger.warning(
-                    f"{self.name} WARNING: Graph may not be fully connected! Check bond detection."
-                )
 
             # Visualize the graph connectivity for debugging
             components = list(nx.connected_components(G))
@@ -347,11 +313,189 @@ class MolecularGraph:
                 # Print a few atoms in each component
                 if len(comp) > 0:
                     sample = list(comp)[:3]  # First 3 atoms
-                    self.logger.info(
-                        f"  Sample atoms: {[G.nodes[n]['name'] for n in sample]}"
+                        self.logger.info(
+                        f"  Sample atoms: {[cast(Dict[str, str], G.nodes[n])['name'] for n in sample]}"
                     )
 
         return G
+
+    def _infer_missing_edges(self, G: nx.Graph) -> None:
+        """Infer missing edges based on atomic distances.
+
+        Args:
+            G: NetworkX graph to add edges to
+        """
+        if self.logger:
+            self.logger.info(f"{self.name} Inferring missing edges based on distances")
+
+        # Define typical bond lengths (in Angstroms)
+        max_bond_lengths = {
+            ("C", "C"): 1.6,  # Single C-C bond
+            ("C", "N"): 1.5,  # C-N bond
+            ("C", "O"): 1.5,  # C-O bond
+            ("N", "N"): 1.5,  # N-N bond
+            ("N", "O"): 1.5,  # N-O bond
+            ("O", "O"): 1.5,  # O-O bond
+        }
+
+        edges_added = 0
+        for i, atom1 in enumerate(self.atoms):
+            for j, atom2 in enumerate(self.atoms[i + 1 :], i + 1):
+                # Skip if edge already exists
+                if G.has_edge(atom1, atom2):
+                    continue
+
+                # Get elements
+                elem1 = G.nodes[atom1].get("element", "")
+                elem2 = G.nodes[atom2].get("element", "")
+
+                # Skip if either atom is hydrogen
+                if elem1 == "H" or elem2 == "H":
+                    continue
+
+                # Get bond length threshold - try both orderings
+                bond_pair = tuple(sorted([elem1, elem2]))
+                max_length = max_bond_lengths.get(bond_pair, 1.6)  # Default to 1.6Å
+
+                # Calculate distance
+                dist = np.linalg.norm(atom1.coord - atom2.coord)
+
+                # Add edge if atoms are close enough
+                if dist <= max_length:
+                                        G.add_edge(atom1, atom2)
+                    edges_added += 1
+                                        if self.logger:
+                                            self.logger.debug(
+                            f"{self.name} Added inferred edge: {atom1.name}-{atom2.name} ({dist:.2f}Å)"
+                                            )
+
+            if self.logger:
+            self.logger.info(f"{self.name} Added {edges_added} inferred edges")
+
+    def _log_connectivity_info(self, G: nx.Graph) -> None:
+        """Log detailed connectivity information for debugging.
+
+        Args:
+            G: NetworkX graph to analyze
+        """
+        if not self.logger:
+            return
+
+        # Log all edges
+        self.logger.debug(f"\n{self.name} Edge list:")
+        for edge in G.edges():
+            atom1, atom2 = edge
+            self.logger.debug(
+                f"  {atom1.name}({atom1.serial_number}) - {atom2.name}({atom2.serial_number})"
+            )
+
+        # Find isolated atoms
+        isolated = list(nx.isolates(G))
+        if isolated:
+            self.logger.debug(f"\n{self.name} Isolated atoms:")
+            for atom in isolated:
+                self.logger.debug(
+                    f"  {atom.name}({atom.serial_number}) - Element: {atom.element if hasattr(atom, 'element') else 'Unknown'}"
+                )
+
+        # Analyze connected components
+        components = list(nx.connected_components(G))
+        self.logger.debug(f"\n{self.name} Connected components analysis:")
+        for i, comp in enumerate(components):
+            self.logger.debug(f"\nComponent {i+1} ({len(comp)} atoms):")
+            for atom in comp:
+                neighbors = list(G.neighbors(atom))
+                self.logger.debug(
+                    f"  {atom.name}({atom.serial_number}) - {len(neighbors)} connections: "
+                    f"{[f'{n.name}({n.serial_number})' for n in neighbors]}"
+                )
+
+    def _add_conect_edges(self, G: nx.Graph) -> int:
+        """Add edges based on CONECT records from PDB file.
+
+        Returns:
+            Number of edges added
+        """
+        if not self.conect_dict:
+            return 0
+
+        if self.logger:
+            self.logger.info(
+                f"{self.name} Using CONECT records from PDB for connectivity"
+            )
+
+            edge_count = 0
+        missing_serials = []
+        missing_connections = []
+
+        # Direct mapping using CONECT records based on serial numbers
+            for serial, connected_serials in self.conect_dict.items():
+            # Serial number needs to be in our atom list
+            if serial in self.serial_to_atom:
+                atom1 = self.serial_to_atom[serial]
+                    for connected_serial in connected_serials:
+                    if connected_serial in self.serial_to_atom:
+                        atom2 = self.serial_to_atom[connected_serial]
+                            # Only add each edge once (avoid duplicates)
+                            if atom1 != atom2 and not G.has_edge(atom1, atom2):
+                                G.add_edge(atom1, atom2)
+                                edge_count += 1
+                        if self.logger and self.logger.isEnabledFor(logging.DEBUG):
+                                    self.logger.debug(
+                                        f"{self.name} Edge from CONECT: {atom1.name}({serial})-{atom2.name}({connected_serial})"
+                                    )
+        else:
+                        missing_connections.append(connected_serial)
+                        if self.logger and self.logger.isEnabledFor(logging.DEBUG):
+                            self.logger.debug(
+                                f"Connected serial {connected_serial} not found in atom list"
+                            )
+            else:
+                missing_serials.append(serial)
+                if self.logger and self.logger.isEnabledFor(logging.DEBUG):
+                    self.logger.debug(f"Serial {serial} not found in atom list")
+
+        # Log any issues with missing serials
+        if missing_serials and self.logger:
+            self.logger.warning(
+                f"{self.name} Could not find {len(missing_serials)} atom serials in the structure: {missing_serials[:10]}..."
+            )
+
+        if missing_connections and self.logger:
+            self.logger.warning(
+                f"{self.name} Could not find {len(missing_connections)} connected atom serials: {missing_connections[:10]}..."
+                                )
+
+        if self.logger:
+            self.logger.info(
+                f"{self.name} Added {edge_count} edges from CONECT records"
+            )
+
+        return edge_count
+
+    def _get_residue_info(self, residue: Optional[Residue]) -> Tuple[str, str]:
+        """Get residue name and ID safely.
+
+        Args:
+            residue: Bio.PDB.Residue object or None
+
+        Returns:
+            Tuple of (residue_name, residue_id)
+        """
+        if residue is None:
+            return "", ""
+        return getattr(residue, "resname", ""), str(getattr(residue, "id", ""))
+
+    def _get_atom_element(self, atom: Atom) -> str:
+        """Get the element of an atom safely.
+
+        Args:
+            atom: Bio.PDB.Atom object
+
+        Returns:
+            Element of the atom
+        """
+        return getattr(atom, "element", "C")  # Default to carbon if element is not set
 
 
 class IsomorphicSuperimposer:
@@ -427,16 +571,13 @@ class IsomorphicSuperimposer:
         if self.logger:
             self.logger.info("Starting custom graph matching...")
 
-        # Start directly with a comprehensive approach that tries all possible starting combinations
-        # Skip the terminal nodes approach since that's failing
-
         def node_matches(node1, node2):
             """Match atoms based on element type with fallback to name matching."""
             # Get element and name information
-            element1 = reference_graph.nodes[node1]["element"].strip()
-            element2 = model_graph.nodes[node2]["element"].strip()
-            name1 = reference_graph.nodes[node1]["name"].strip()
-            name2 = model_graph.nodes[node2]["name"].strip()
+            element1 = reference_graph.nodes[node1].get("element", "").strip()
+            element2 = model_graph.nodes[node2].get("element", "").strip()
+            name1 = reference_graph.nodes[node1].get("name", "").strip()
+            name2 = model_graph.nodes[node2].get("name", "").strip()
 
             # Skip hydrogen atoms
             if element1 == "H" or element2 == "H":
@@ -559,12 +700,12 @@ class IsomorphicSuperimposer:
         ref_atoms = [
             n
             for n in reference_graph.nodes()
-            if reference_graph.nodes[n]["element"].strip() != "H"
+            if reference_graph.nodes[n].get("element", "").strip() != "H"
         ]
         model_atoms = [
             n
             for n in model_graph.nodes()
-            if model_graph.nodes[n]["element"].strip() != "H"
+            if model_graph.nodes[n].get("element", "").strip() != "H"
         ]
 
         if self.logger:
@@ -576,13 +717,13 @@ class IsomorphicSuperimposer:
 
         # Try all possible starting points
         for ref_atom in ref_atoms:
-            ref_element = reference_graph.nodes[ref_atom]["element"].strip()
+            ref_element = reference_graph.nodes[ref_atom].get("element", "").strip()
 
             # Only try atoms with matching elements
             matching_model_atoms = [
                 m
                 for m in model_atoms
-                if model_graph.nodes[m]["element"].strip() == ref_element
+                if model_graph.nodes[m].get("element", "").strip() == ref_element
             ]
 
             if self.logger:
@@ -591,7 +732,7 @@ class IsomorphicSuperimposer:
                 )
 
             # Progress tracking for large molecules
-            if len(matching_model_atoms) > 10:
+            if len(matching_model_atoms) > 10 and self.logger:
                 self.logger.info(
                     f"Testing {ref_atom.name} against {len(matching_model_atoms)} model atoms..."
                 )
@@ -599,7 +740,7 @@ class IsomorphicSuperimposer:
             # Try each potential match
             for i, model_atom in enumerate(matching_model_atoms):
                 # Print progress occasionally
-                if i % 10 == 0 and len(matching_model_atoms) > 20:
+                if i % 10 == 0 and len(matching_model_atoms) > 20 and self.logger:
                     self.logger.info(
                         f"  Tried {i}/{len(matching_model_atoms)} model atoms..."
                     )
@@ -613,13 +754,13 @@ class IsomorphicSuperimposer:
                         )
 
                     # If we've found a complete match, stop searching
-                    if len(match) == len(ref_atoms):
+                    if len(match) == len(ref_atoms) and self.logger:
                         self.logger.info("Found complete match, stopping search")
                         break
 
             # If we've found a good enough match, stop searching
             # "Good enough" means most of the reference atoms are matched
-            if len(best_match) >= 0.8 * len(ref_atoms):
+            if len(best_match) >= 0.8 * len(ref_atoms) and self.logger:
                 self.logger.info(
                     f"Found good match with {len(best_match)}/{len(ref_atoms)} atoms, stopping search"
                 )
@@ -673,145 +814,140 @@ def setup_logging(verbose_level) -> logging.Logger:
     return logger
 
 
+@functools.lru_cache(maxsize=16)
+def get_pdb_lines(pdb_file: str) -> List[str]:
+    """Get lines from a PDB file with caching.
+
+    Args:
+        pdb_file: Path to the PDB file
+
+    Returns:
+        List of lines from the PDB file
+    """
+    # Check file cache first
+    if pdb_file in _FILE_CACHE:
+        return _FILE_CACHE[pdb_file]
+
+    # Read the file and cache it
+    with open(pdb_file, "r") as f:
+        lines = f.readlines()
+
+    # Cache the result for future use
+    _FILE_CACHE[pdb_file] = lines
+    return lines
+
+
+def get_structure(pdb_file: str, structure_id: Optional[str] = None) -> Structure:
+    """Get a BioPython structure from a PDB file with caching.
+
+    Args:
+        pdb_file: Path to the PDB file
+        structure_id: Identifier for the structure
+
+    Returns:
+        BioPython Structure object
+    """
+    # Create a unique cache key from file path and structure ID
+    cache_key = f"{pdb_file}_{structure_id if structure_id else 'default'}"
+
+    # Check structure cache
+    if cache_key in _PDB_STRUCTURE_CACHE:
+        return _PDB_STRUCTURE_CACHE[cache_key]
+
+    # Parse the structure
+    if structure_id is None:
+        structure_id = Path(pdb_file).stem
+
+    structure = PDB_PARSER.get_structure(structure_id, pdb_file)
+    if not isinstance(structure, Structure):
+        raise ValueError(f"Failed to parse structure from {pdb_file}")
+
+    # Cache the result
+    _PDB_STRUCTURE_CACHE[cache_key] = structure
+    return structure
+
+
 def extract_chain_from_reference(
     reference_pdb: str, chain_ids: List[str], output_file: Path, logger: logging.Logger
 ) -> Path:
-    """Extract specific chains from reference structure and preserve original atom serial numbers."""
-    try:
-        # First, parse the structure to get the original atoms
-        parser = PDBParser(QUIET=True)
-        reference = parser.get_structure("reference", reference_pdb)
+    """Extract specific chains from a PDB file.
 
-        # Read the original file to track the original serial numbers
-        original_serials = {}
-        with open(reference_pdb, "r") as f:
-            for line in f:
-                if line.startswith(("ATOM", "HETATM")):
-                    serial = int(line[6:11].strip())
-                    atom_name = line[12:16].strip()
-                    chain_id = line[21:22].strip()
-                    if chain_id in chain_ids:
-                        # Create a unique key for this atom
-                        residue_id = int(line[22:26].strip())
-                        key = (chain_id, residue_id, atom_name)
-                        original_serials[key] = serial
-
-        # Now we manually write our PDB with preserved serial numbers
-        with open(output_file, "w") as out:
-            with open(reference_pdb, "r") as inp:
-                for line in inp:
-                    if line.startswith(("ATOM", "HETATM")):
-                        chain_id = line[21:22].strip()
-                        if chain_id in chain_ids:
-                            # Preserve the original line with atom serial number
-                            out.write(line)
-                    elif line.startswith("CONECT"):
-                        # Include CONECT records
-                        # We'll filter relevant ones later in the superimposition process
-                        out.write(line)
-
-        logger.info(f"Extracted chains {','.join(chain_ids)} to {output_file}")
-        return output_file
-    except Exception as e:
-        logger.error(f"Error extracting chains from {reference_pdb}: {str(e)}")
-        raise
-
-
-def get_model_from_pdb(
-    pdb_path: str, model_num: int, logger: logging.Logger
-) -> Optional[Tuple[Structure, Dict, List[str]]]:
-    """Extract a specific model from a PDB file.
+    This optimized version uses caching to avoid re-reading files.
 
     Args:
-        pdb_path: Path to the PDB file
-        model_num: Model number to extract (0-indexed)
+        reference_pdb: Path to reference PDB file
+        chain_ids: List of chain IDs to extract
+        output_file: Output file path
         logger: Logger instance
 
     Returns:
-        Tuple of (Structure, CONECT_dict, header_lines) or None if extraction fails
+        Path to extracted chain file
     """
-    try:
-        atoms = []
-        conect_lines = []
-        header_lines = []
-        current_model = -1
-        reading_model = False
-        in_header = True
+    # Create output directory if it doesn't exist
+    output_file.parent.mkdir(parents=True, exist_ok=True)
 
-        with open(pdb_path, "r") as f:
-            for line in f:
-                # Capture header information before first MODEL
-                if in_header and not line.startswith(("END", "MASTER", "CONECT")):
-                    if not line.startswith(("END", "MASTER", "CONECT")):
-                        header_lines.append(line.rstrip())
+    # Check if output file already exists
+    if output_file.exists():
+        logger.info(f"Using existing extracted chain file: {output_file}")
+        return output_file
 
-                if line.startswith("MODEL"):
-                    current_model += 1
-                    in_header = False
-                    if current_model == model_num:
-                        reading_model = True
-                        atoms = []
-                        conect_lines = []
-                elif line.startswith("ENDMDL"):
-                    if reading_model:
-                        break
-                elif reading_model:
-                    if line.startswith(("ATOM", "HETATM")):
-                        atoms.append(line)
-                    elif line.startswith("CONECT"):
-                        conect_lines.append(line.rstrip())
+    # Get the structure from cache or disk
+    structure = get_structure(reference_pdb, f"ref_{'-'.join(chain_ids)}")
 
-                # For single model files without MODEL records
-                if in_header and line.startswith(("ATOM", "HETATM")):
-                    in_header = False
-                    if model_num == 0:  # First model
-                        reading_model = True
-                        atoms.append(line)
-                elif in_header and line.startswith("CONECT"):
-                    conect_lines.append(line.rstrip())
+    # Create a new structure with only the desired chains
+    logger.info(f"Extracting chains {chain_ids} from {reference_pdb}")
 
-        # If no MODEL records found or this is the first model, treat as single model
-        if (current_model == -1 or model_num == 0) and not reading_model:
-            with open(pdb_path, "r") as f:
-                in_header = True
-                for line in f:
-                    # Skip header lines we've already captured
-                    if (
-                        in_header
-                        and not line.startswith(("END", "MASTER", "CONECT"))
-                        and line.strip()
-                    ):
-                        header_lines.append(line.rstrip())
+    # Write the structure with only the selected chains
+    io = PDBIO()
+    io.set_structure(structure)
+    io.save(str(output_file), ChainSelect(chain_ids))
 
-                    if line.startswith(("ATOM", "HETATM")):
-                        in_header = False
-                        atoms.append(line)
-                    elif line.startswith("CONECT"):
-                        conect_lines.append(line.rstrip())
+    logger.info(f"Saved extracted chains to {output_file}")
+    return output_file
 
-        # If no atoms found, return None
-        if not atoms:
-            logger.warning(f"No atoms found for model {model_num} in {pdb_path}")
-            return None
 
-        # Write temporary PDB file with just this model
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".pdb", delete=False) as temp:
-            temp.write("MODEL        1\n")
-            for atom_line in atoms:
-                temp.write(atom_line)
-            temp.write("ENDMDL\n")
-            temp_name = temp.name
+def parse_conect_records(
+    pdb_file: str, model_num: Optional[int] = None
+) -> Dict[int, List[int]]:
+    """Parse CONECT records from a PDB file.
 
-        # Parse the temporary file
-        parser = PDBParser(QUIET=True)
-        structure = parser.get_structure("temp", temp_name)
+    Args:
+        pdb_file: Path to PDB file
+        model_num: Model number to extract (if None, get all)
 
-        # Clean up
-        os.unlink(temp_name)
+    Returns:
+        Dictionary mapping atom serial numbers to lists of connected atom serial numbers
+    """
+    # Create a cache key that includes the model number
+    cache_key = f"{pdb_file}_{model_num if model_num is not None else 'all'}"
 
-        # Parse CONECT records
+    # Check cache first
+    if cache_key in _CONECT_CACHE:
+        return _CONECT_CACHE[cache_key]
+
+    # Read the PDB file lines (using the cached version if available)
+    lines = get_pdb_lines(pdb_file)
+
+    # Extract CONECT records
         conect_dict = {}
-        for line in conect_lines:
+    model_found = model_num is None  # If model_num is None, process all lines
+
+    for line in lines:
+        if model_num is not None:
+            if line.startswith("MODEL"):
+                # Check if this is the model we want
+                try:
+                    current_model = int(line.split()[1])
+                    model_found = current_model == model_num
+                except (IndexError, ValueError):
+                    model_found = False
+            elif line.startswith("ENDMDL"):
+                model_found = False
+
+            if not model_found:
+                continue
+
+        if line.startswith("CONECT"):
             parts = line.split()
             if len(parts) > 2:  # At least one connection
                 atom_serial = int(parts[1])
@@ -820,862 +956,798 @@ def get_model_from_pdb(
                     conect_dict[atom_serial] = []
                 conect_dict[atom_serial].extend(connected_serials)
 
-        return structure, conect_dict, header_lines
-
-    except Exception as e:
-        logger.error(f"Error extracting model {model_num} from {pdb_path}: {str(e)}")
-        return None
+    # Cache the result
+    _CONECT_CACHE[cache_key] = conect_dict
+    return conect_dict
 
 
 def count_models_in_pdb(pdb_path: str) -> int:
     """Count the number of models in a PDB file.
 
     Args:
-        pdb_path: Path to the PDB file
+        pdb_path: Path to PDB file
 
     Returns:
-        Number of models in the file (at least 1)
+        Number of models
     """
+    # This is a quick counting function that doesn't need to parse the full file
+    lines = get_pdb_lines(pdb_path)
+
     model_count = 0
-    with open(pdb_path, "r") as f:
-        for line in f:
+    for line in lines:
             if line.startswith("MODEL"):
                 model_count += 1
 
-    # If no MODEL records found, treat as single model
-    if model_count == 0:
-        model_count = 1
-
-    return model_count
+    # If no MODEL records found, assume it's a single model
+    return max(1, model_count)
 
 
-def parse_conect_records(pdb_file: str, model_num: int = None) -> Dict[int, List[int]]:
-    """Parse CONECT records from a PDB file.
+def parse_pdb_for_ligand(
+    pdb_file: str, chain_id: str, logger: logging.Logger
+) -> Tuple[List[Atom], Dict[int, List[int]]]:
+    """Parse a PDB file directly to extract atoms and CONECT records.
+
+    This approach preserves original serial numbers and extracts exact connectivity information.
 
     Args:
-        pdb_file: Path to the PDB file
-        model_num: Optional model number to extract CONECT records for (0-indexed)
+        pdb_file: Path to PDB file
+        chain_id: Chain ID to extract (e.g., "D" for ligand)
+        logger: Logger instance
 
     Returns:
-        Dictionary mapping atom serial numbers to lists of connected atom serial numbers.
+        Tuple of (list of atoms, CONECT dictionary)
     """
+    # Get all lines from the PDB
+    lines = get_pdb_lines(pdb_file)
+
+    # Extract atoms and CONECT records
+    atoms = []
     conect_dict = {}
-    current_model = -1
-    in_target_model = model_num is None  # If no model specified, get all CONECT records
+    atom_serial_to_idx = {}
 
-    try:
-        with open(pdb_file, "r") as f:
-            for line in f:
-                if line.startswith("MODEL"):
-                    current_model += 1
-                    in_target_model = model_num is None or current_model == model_num
-                elif line.startswith("ENDMDL"):
-                    if model_num is not None and current_model == model_num:
-                        # We've processed the target model, we can stop
-                        break
-                    in_target_model = model_num is None  # Reset for single-model files
+    # First extract all atoms for the specified chain
+    for line in lines:
+        if line.startswith(("ATOM ", "HETATM")):
+            # Check chain ID (column 21-22)
+            if line[21:22].strip() == chain_id:
+                try:
+                    serial = int(line[6:11].strip())
+                    atom_name = line[12:16].strip()
+                    residue_name = line[17:20].strip()
 
-                # For files without MODEL records, consider everything as model 0
-                if model_num == 0 and current_model == -1:
-                    in_target_model = True
+                    # Add to our list and track serial number
+                    atoms.append((serial, atom_name, residue_name, line))
+                    atom_serial_to_idx[serial] = len(atoms) - 1
+                except ValueError:
+                    logger.warning(f"Skipping line with invalid serial number: {line}")
 
-                # Parse CONECT records if we're in the target model or looking at all models
-                if in_target_model and line.startswith("CONECT"):
-                    # Format: CONECT serial# serial# serial# ...
-                    # First serial is the atom, rest are connected atoms
+    logger.info(f"Extracted {len(atoms)} atoms from chain {chain_id}")
+
+    # Now extract CONECT records and filter only those that connect our chain's atoms
+    for line in lines:
+        if line.startswith("CONECT"):
                     parts = line.split()
                     if len(parts) > 2:  # At least one connection
                         try:
                             atom_serial = int(parts[1])
-                            connected_serials = [
-                                int(parts[i]) for i in range(2, len(parts))
-                            ]
+                    # Only include if this atom is in our chain
+                    if atom_serial in atom_serial_to_idx:
+                        connected_serials = []
+                        for i in range(2, len(parts)):
+                            connected_serial = int(parts[i])
+                            # Only include connections to atoms in our chain
+                            if connected_serial in atom_serial_to_idx:
+                                connected_serials.append(connected_serial)
 
-                            # Create entry or append to existing
+                        if (
+                            connected_serials
+                        ):  # Only add if there are connections to our chain
                             if atom_serial not in conect_dict:
                                 conect_dict[atom_serial] = []
-
-                            # Avoid duplicates
-                            for serial in connected_serials:
-                                if serial not in conect_dict[atom_serial]:
-                                    conect_dict[atom_serial].append(serial)
+                            conect_dict[atom_serial].extend(connected_serials)
                         except ValueError:
-                            # Skip malformed CONECT records
-                            continue
+                    logger.warning(
+                        f"Skipping CONECT with invalid serial number: {line}"
+                    )
 
-        return conect_dict
-    except Exception as e:
-        print(f"Error parsing CONECT records: {e}")
-        return {}
-
-
-def calculate_clashes(
-    structure1_atoms: List, structure2_atoms: List, cutoff: float = 1.5
-) -> int:
-    """Calculate the number of clashing atoms between two structures.
-
-    Args:
-        structure1_atoms: List of atoms from first structure
-        structure2_atoms: List of atoms from second structure
-        cutoff: Distance below which atoms are considered clashing (in Å)
-
-    Returns:
-        Number of clashing atoms
-    """
-    clash_count = 0
-    for atom1 in structure1_atoms:
-        coord1 = np.array(atom1.coord)
-        # Skip hydrogen atoms
-        if atom1.element.strip() == "H":
-            continue
-
-        for atom2 in structure2_atoms:
-            # Skip hydrogen atoms
-            if atom2.element.strip() == "H":
-                continue
-
-            # Skip comparing against itself
-            if atom1 == atom2:
-                continue
-
-            coord2 = np.array(atom2.coord)
-            dist = np.linalg.norm(coord1 - coord2)
-
-            if dist < cutoff:
-                clash_count += 1
-                break  # Count each atom only once
-
-    return clash_count
-
-
-def superimpose_model(
-    reference_ligand_atoms: List,
-    model_atoms: List,
-    logger: logging.Logger,
-    reference_pdb: str = None,
-    model_pdb: str = None,
-) -> Tuple[Optional[np.ndarray], Optional[np.ndarray], float, int]:
-    """Superimpose a model onto a reference using graph-based isomorphism.
-
-    Args:
-        reference_ligand_atoms: Atoms from reference ligand
-        model_atoms: Atoms from model to superimpose
-        logger: Logger instance
-        reference_pdb: Path to reference PDB for CONECT records
-        model_pdb: Path to model PDB for CONECT records
-
-    Returns:
-        Tuple of (rotation matrix, translation vector, RMSD, number of matched atoms)
-    """
-    # Log basic atom information
-    logger.info(f"Reference ligand: {len(reference_ligand_atoms)} atoms")
-    logger.info(f"Model: {len(model_atoms)} atoms")
-
-    # Parse CONECT records from model PDB if provided
-    model_conect_dict = {}
-    if model_pdb:
-        logger.info(f"Parsing CONECT records from {model_pdb}")
-        model_conect_dict = parse_conect_records(model_pdb)
-        logger.info(
-            f"Found {len(model_conect_dict)} atoms with CONECT records in model"
-        )
-
-    # Create or reuse molecular graphs
-    if _REFERENCE_DATA["ref_graph"] is None:
-        # Parse CONECT records from reference PDB if provided and not already cached
-        ref_conect_dict = {}
-        if reference_pdb:
-            logger.info(f"Parsing CONECT records from {reference_pdb}")
-            ref_conect_dict = parse_conect_records(reference_pdb)
-            logger.info(
-                f"Found {len(ref_conect_dict)} atoms with CONECT records in reference"
-            )
-            _REFERENCE_DATA["ref_conect_dict"] = ref_conect_dict
-
-        # For the reference, specify it's chain D (the UNL ligand)
-        ref_graph = MolecularGraph(
-            reference_ligand_atoms,
-            logger,
-            name="REF",
-            conect_dict=ref_conect_dict,
-            chain_id="D",
-        )
-        _REFERENCE_DATA["ref_graph"] = ref_graph
-    else:
-        ref_graph = _REFERENCE_DATA["ref_graph"]
-        logger.info("Using cached reference graph")
-
-    # For the model, use its CONECT records
-    model_graph = MolecularGraph(
-        model_atoms, logger, name="MODEL", conect_dict=model_conect_dict
+    # Log connectivity info
+    total_connections = sum(len(v) for v in conect_dict.values())
+    logger.info(
+        f"Found {len(conect_dict)} atoms with connections in chain {chain_id} (total {total_connections} connections)"
     )
 
-    # Print some basic graph diagnostics
-    if logger.level <= logging.INFO:
-        # Check atom types in both graphs
-        ref_elements = set(
-            ref_graph.graph.nodes[n]["element"] for n in ref_graph.graph.nodes
-        )
-        model_elements = set(
-            model_graph.graph.nodes[n]["element"] for n in model_graph.graph.nodes
-        )
-
-        logger.info(f"Reference elements: {sorted(ref_elements)}")
-        logger.info(f"Model elements: {sorted(model_elements)}")
-
-        # Check if all reference elements exist in model
-        missing_elements = ref_elements - model_elements
-        if missing_elements:
-            logger.warning(
-                f"Elements in reference but not in model: {missing_elements}"
-            )
-
-    # Perform alignment
-    logger.info("Starting alignment...")
-
-    # Create or reuse superimposer instance
-    if _REFERENCE_DATA["superimposer"] is None:
-        # Create a new superimposer instance
-        custom_superimposer = IsomorphicSuperimposer(logger)
-        _REFERENCE_DATA["superimposer"] = custom_superimposer
-    else:
-        custom_superimposer = _REFERENCE_DATA["superimposer"]
-
-    result = custom_superimposer.align(ref_graph, model_graph)
-
-    # Return the desired values
-    if result.transformation_matrix is not None:
-        rotation, translation = result.transformation_matrix
-        return rotation, translation, result.rmsd, result.matched_atoms
-    else:
-        return None, None, float("inf"), 0
-
-
-def apply_transformation_to_structure(
-    structure: Structure, rotation: np.ndarray, translation: np.ndarray
-) -> None:
-    """Apply transformation to all atoms in a structure.
-
-    Args:
-        structure: Structure to transform
-        rotation: Rotation matrix
-        translation: Translation vector
-    """
-    for model in structure:
-        for chain in model:
-            for residue in chain:
-                for atom in residue:
-                    atom.transform(rotation, translation)
-
-
-def format_pdb_atom_line(atom, residue, chain_id=None):
-    """Format an atom for PDB output with proper element handling.
-
-    In PDB format, the element field is in columns 77-78. For hydrogen atoms,
-    it's important to format them correctly to ensure proper visualization.
-    Other elements also need specific handling to ensure proper connectivity.
-    """
-    # Use the chain ID from the parameter if provided, otherwise from the residue's parent chain
-    chain_id_to_use = chain_id if chain_id else residue.get_parent().id
-
-    # Handle element formatting - standardize to PDB conventions
-    # PDB standard is right-justified in a 2-character field
-    element = atom.element.strip().upper()
-
-    # Special case for hydrogen (should be 'H ' not ' H')
-    if element == "H":
-        element_field = "H "
-    # Special case for single-letter elements (C, N, O, S, P, etc.)
-    elif len(element) == 1:
-        element_field = f"{element} "
-    # Standard handling for two-letter elements (CA, MG, etc.)
-    else:
-        element_field = element[:2]  # Limit to 2 characters
-
-    # Format the atom line according to PDB standard
-    # The element field is deliberately right-padded with spaces to ensure it ends at column 78
-    # This is crucial for proper element recognition by visualization programs
-    return f"ATOM  {atom.serial_number:5d} {atom.name:^4} {residue.resname:<3} {chain_id_to_use:1}{residue.id[1]:4d}    {atom.coord[0]:8.3f}{atom.coord[1]:8.3f}{atom.coord[2]:8.3f}  1.00  0.00           {element_field}\n"
-
-
-def superimpose_trajectory(
-    args: Tuple[str, str, str, bool, Optional[int], Optional[int], Optional[int], bool],
-) -> Optional[Tuple[str, Dict[int, float]]]:
-    """Superimpose a trajectory to the reference structure."""
-    pdb_path, reference_pdb, output_dir, verbose, start, stop, stride, force = args
-
-    # Configure logging based on verbosity
-    log_level = logging.INFO if verbose else logging.WARNING
-    if verbose == "debug":
-        log_level = logging.DEBUG
-    logger = logging.getLogger(f"superimpose_{Path(pdb_path).stem}")
-    logger.setLevel(log_level)
-
-    # Configure file handler
-    logs_dir = Path(output_dir) / "logs"
-    logs_dir.mkdir(exist_ok=True)
-    file_handler = logging.FileHandler(
-        logs_dir / f"{Path(pdb_path).stem}_superimpose.log", mode="w"
-    )
-    file_handler.setLevel(log_level)
-    formatter = logging.Formatter(
-        "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
-    )
-    file_handler.setFormatter(formatter)
-    logger.addHandler(file_handler)
-
-    # Also add console handler for visual feedback
-    console_handler = logging.StreamHandler()
-    console_handler.setLevel(log_level)
-    logger.addHandler(console_handler)
-
-    # Check if files exist
-    if not os.path.exists(pdb_path):
-        logger.error(f"PDB file not found: {pdb_path}")
-        return None
-    if not os.path.exists(reference_pdb):
-        logger.error(f"Reference PDB file not found: {reference_pdb}")
-        return None
-
-    # Create output directory structure
-    output_path = Path(output_dir)
-    output_path.mkdir(exist_ok=True)
-
-    # Generate output file name
-    rel_path = Path(pdb_path).relative_to(Path(pdb_path).parent.parent)
-    output_file = output_path / f"{rel_path.stem}_superimposed.pdb"
-    rmsd_file = output_path / f"{rel_path.stem}_rmsd.json"
-
-    # Check if already processed
-    if not force and output_file.exists() and rmsd_file.exists():
-        logger.info(f"Skipping already processed file: {pdb_path}")
-        return str(pdb_path), {}
+    # Load the structure with BioPython but preserve original serial numbers
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".pdb", delete=False) as f:
+        for _, _, _, line in atoms:
+            f.write(line)
+        temp_file = f.name
 
     try:
-        with tempfile.TemporaryDirectory(prefix="superimpose_") as temp_dir_str:
-            temp_dir = Path(temp_dir_str)
+        # Parse the structure
+        structure = get_structure("chain_" + chain_id, temp_file)
+        if not isinstance(structure, Structure):
+            raise ValueError(f"Failed to parse structure from {temp_file}")
 
-            # Initialize reference data if not already done
-            if _REFERENCE_DATA["ref_ligand_atoms"] is None:
-                # Extract reference ligand (chain D)
-                ref_ligand_file = extract_chain_from_reference(
-                    reference_pdb, ["D"], temp_dir / "reference_ligand.pdb", logger
-                )
+        # Get the atoms and tag them with original serials
+        biopython_atoms = list(structure.get_atoms())
 
-                # Extract reference protein (chains A, B, C)
-                ref_protein_file = extract_chain_from_reference(
-                    reference_pdb,
-                    ["A", "B", "C"],
-                    temp_dir / "reference_protein.pdb",
-                    logger,
-                )
-
-                # Load reference structures
-                parser = PDBParser(QUIET=True)
-                ref_ligand = parser.get_structure("ref_ligand", str(ref_ligand_file))
-                ref_protein = parser.get_structure("ref_protein", str(ref_protein_file))
-
-                # Get reference ligand atoms for superimposition
-                ref_ligand_atoms = list(unfold_entities(ref_ligand[0]["D"], "A"))
-
-                if not ref_ligand_atoms:
-                    logger.error("No atoms found in reference ligand")
-                    return None
-
-                logger.info(f"Reference ligand has {len(ref_ligand_atoms)} atoms")
-
-                # Cache reference data
-                _REFERENCE_DATA["ref_ligand_atoms"] = ref_ligand_atoms
-                _REFERENCE_DATA["ref_protein"] = ref_protein
-                _REFERENCE_DATA["ref_ligand"] = ref_ligand
-            else:
-                # Use cached reference data
-                ref_ligand_atoms = _REFERENCE_DATA["ref_ligand_atoms"]
-                ref_protein = _REFERENCE_DATA["ref_protein"]
-                ref_ligand = _REFERENCE_DATA["ref_ligand"]
-                logger.info("Using cached reference data")
-
-            # Count models in trajectory
-            model_count = count_models_in_pdb(pdb_path)
-            logger.info(f"Found {model_count} models in {pdb_path}")
-
-            if model_count == 0:
-                logger.error(f"No models found in {pdb_path}")
-                return None
-
-            # Apply start, stop, stride parameters
-            model_indices = list(range(model_count))
-
-            # Apply slicing parameters if provided
-            if start is not None or stop is not None or stride is not None:
-                # Default values
-                start_idx = 0 if start is None else start
-                stop_idx = model_count if stop is None else min(stop, model_count)
-                stride_val = 1 if stride is None else stride
-
-                # Adjust for negative indices
-                if start_idx < 0:
-                    start_idx = max(0, model_count + start_idx)
-                if stop_idx < 0:
-                    stop_idx = max(0, model_count + stop_idx)
-
-                # Create sliced list of indices
-                model_indices = model_indices[start_idx:stop_idx:stride_val]
-                logger.info(
-                    f"Processing {len(model_indices)} models with slice [{start_idx}:{stop_idx}:{stride_val}]"
-                )
-            else:
-                logger.info(f"Processing all {model_count} models")
-
-            # Dictionary to store RMSD values
-            rmsd_values = {}
-            successful_models = 0
-
-            # Create output PDB file
-            with open(output_file, "w") as f:
-                # Write header
-                f.write("TITLE     Superimposed MD Trajectory\n")
-                f.write(f"REMARK    Reference: {reference_pdb}\n")
-                f.write(f"REMARK    Trajectory: {pdb_path}\n")
-                f.write(f"REMARK    Method: Isomorphic Graph Matching\n")
-
-                # Write reference model (model 0)
-                f.write("MODEL        0\n")
-                f.write("REMARK    Reference structure\n")
-
-                # Write reference protein chains
-                for chain in ref_protein[0]:
-                    for residue in chain:
-                        for atom in residue:
-                            f.write(format_pdb_atom_line(atom, residue))
-
-                # Write reference ligand
-                for residue in ref_ligand[0]["D"]:
-                    for atom in residue:
-                        f.write(format_pdb_atom_line(atom, residue, chain_id="D"))
-
-                # Write CONECT records from reference if available
-                ref_conect_dict = parse_conect_records(reference_pdb)
-                for serial, connected_serials in ref_conect_dict.items():
-                    # Only write CONECT records for atoms in our reference structure
-                    atom_found = False
-                    for chain in ref_protein[0]:
-                        for residue in chain:
-                            for atom in residue:
-                                if atom.serial_number == serial:
-                                    atom_found = True
-                                    break
-                            if atom_found:
-                                break
-                        if atom_found:
-                            break
-
-                    if not atom_found:
-                        for residue in ref_ligand[0]["D"]:
-                            for atom in residue:
-                                if atom.serial_number == serial:
-                                    atom_found = True
-                                    break
-                            if atom_found:
-                                break
-
-                    if atom_found:
-                        conect_line = f"CONECT{serial:5d}"
-                        for connected in connected_serials:
-                            conect_line += f"{connected:5d}"
-                        f.write(conect_line + "\n")
-
-                f.write("ENDMDL\n")
-
-            # Process each model in the trajectory based on slicing
-            for model_idx in model_indices:
-                logger.info(f"Processing model {model_idx+1} from {pdb_path}")
-
-                # Extract the model
-                model_data = get_model_from_pdb(str(pdb_path), model_idx, logger)
-
-                if model_data is None:
-                    logger.warning(f"Failed to extract model {model_idx+1}")
-                    continue
-
-                model_structure, model_conect_dict, model_header_lines = model_data
-
-                if model_structure is None or len(model_structure) == 0:
-                    logger.warning(f"Failed to extract model {model_idx+1}")
-                    continue
-
-                # If model_conect_dict is empty, try to parse from the original file
-                if not model_conect_dict:
-                    logger.info(
-                        f"No CONECT records found in model extraction, trying to parse from original file"
-                    )
-                    # Parse CONECT records specifically for this model number
-                    model_conect_dict = parse_conect_records(str(pdb_path), model_idx)
-                    if model_conect_dict:
-                        logger.info(
-                            f"Successfully parsed {len(model_conect_dict)} CONECT records from original file for model {model_idx}"
-                        )
-                    else:
-                        logger.warning(
-                            f"Could not find CONECT records in original file for model {model_idx}"
-                        )
-                        # Try parsing all CONECT records as fallback
-                        model_conect_dict = parse_conect_records(str(pdb_path))
-                        if model_conect_dict:
-                            logger.info(
-                                f"Parsed {len(model_conect_dict)} CONECT records from entire file"
-                            )
-                        else:
-                            logger.warning(
-                                f"No CONECT records found at all in the file"
-                            )
-
-                # Get all atoms from the model
-                model_atoms = []
-                for chain in model_structure[0]:
-                    model_atoms.extend(list(unfold_entities(chain, "A")))
-
-                if not model_atoms:
-                    logger.warning(f"No atoms found in model {model_idx+1}")
-                    continue
-
-                logger.info(f"Model {model_idx+1} has {len(model_atoms)} atoms")
-
-                # Create superimposer with logger
-                superimposer = IsomorphicSuperimposer(logger)
-
-                # Superimpose model onto reference, passing both CONECT dictionaries
-                try:
-                    rotation, translation, rmsd, matched_atoms = superimpose_model(
-                        ref_ligand_atoms,
-                        model_atoms,
-                        logger,
-                        reference_pdb=reference_pdb,
-                        model_pdb=str(pdb_path),
-                    )
-                except Exception as e:
-                    logger.error(
-                        f"Error during superimposition of model {model_idx+1}: {str(e)}"
-                    )
-                    rotation, translation, rmsd, matched_atoms = (
-                        None,
-                        None,
-                        float("inf"),
-                        0,
-                    )
-
-                if rotation is not None and translation is not None:
-                    # Apply transformation to the model
-                    try:
-                        apply_transformation_to_structure(
-                            model_structure, rotation, translation
-                        )
-                    except Exception as e:
-                        logger.error(
-                            f"Error applying transformation to model {model_idx+1}: {str(e)}"
-                        )
-                        continue
-
-                    # Calculate clashes between model and reference
-                    ref_protein_atoms = []
-                    for chain in ref_protein[0]:
-                        ref_protein_atoms.extend(list(unfold_entities(chain, "A")))
-
-                    try:
-                        # Only consider clashes between the protein (A,B,C chains) and the test compound
-                        # Do not include reference ligand as a clashable object
-                        clash_count = calculate_clashes(model_atoms, ref_protein_atoms)
-                    except Exception as e:
-                        logger.error(
-                            f"Error calculating clashes for model {model_idx+1}: {str(e)}"
-                        )
-                        clash_count = 0
-
-                    # Append to output file
-                    try:
-                        with open(output_file, "a") as f:
-                            f.write(f"MODEL      {model_idx+1}\n")
-
-                            # Add header information from original model
-                            for header_line in model_header_lines:
-                                f.write(f"{header_line}\n")
-
-                            # Add information about the superimposition
-                            f.write(f"REMARK    RMSD: {rmsd:.4f}\n")
-                            f.write(f"REMARK    Matched Atoms: {matched_atoms}\n")
-                            f.write(f"REMARK    Clashing Atoms: {clash_count}\n")
-
-                            # Write transformed model atoms
-                            for chain in model_structure[0]:
-                                for residue in chain:
-                                    for atom in residue:
-                                        f.write(format_pdb_atom_line(atom, residue))
-
-                            # Write CONECT records from the model
-                            for serial, connected_serials in model_conect_dict.items():
-                                # Only write CONECT records for atoms in our model
-                                atom_found = False
-                                atom_obj = None
-
-                                # Create a mapping of serial numbers to ensure we handle all atoms
-                                serial_to_atom = {}
-                                for chain in model_structure[0]:
-                                    for residue in chain:
-                                        for atom in residue:
-                                            serial_to_atom[atom.serial_number] = atom
-
-                                # Check if this serial number exists in our model
-                                if serial in serial_to_atom:
-                                    atom_found = True
-                                    atom_obj = serial_to_atom[serial]
-
-                                    # Filter connected serials to only include those that exist in our model
-                                    valid_connections = [
-                                        conn
-                                        for conn in connected_serials
-                                        if conn in serial_to_atom
-                                    ]
-
-                                    if valid_connections:
-                                        # Write the CONECT record with verified connections
-                                        conect_line = f"CONECT{serial:5d}"
-                                        for connected in valid_connections:
-                                            conect_line += f"{connected:5d}"
-                                        f.write(conect_line + "\n")
-                                    else:
-                                        if self.logger:
-                                            logger.debug(
-                                                f"Skipping CONECT for {serial} - no valid connections"
-                                            )
-
-                            # Also add standard connectivity for common molecules if not already defined
-                            # by CONECT records - this is a fallback for missing connectivity
-                            if len(model_conect_dict) == 0:
-                                logger.warning(
-                                    f"No CONECT records found for model {model_idx+1}, inferring standard connectivity"
-                                )
-                                # Add code to infer standard connectivity if needed
-
-                            f.write("ENDMDL\n")
-
-                        successful_models += 1
-                    except Exception as e:
-                        logger.error(
-                            f"Error writing model {model_idx+1} to output file: {str(e)}"
-                        )
-                        continue
-
-                    # Store RMSD and match information
-                    rmsd_values[model_idx + 1] = {
-                        "rmsd": float(rmsd),
-                        "matched_atoms": matched_atoms,
-                        "clashing_atoms": clash_count,
-                    }
-
-                    logger.info(
-                        f"Model {model_idx+1} superimposed with RMSD: {rmsd:.4f} ({matched_atoms} atoms matched, {clash_count} atoms clashing)"
-                    )
-                else:
-                    logger.warning(f"Failed to superimpose model {model_idx+1}")
-
-            # Save RMSD summary
-            try:
-                with open(rmsd_file, "w") as f:
-                    json.dump(rmsd_values, f, indent=2)
-            except Exception as e:
-                logger.error(f"Error saving RMSD values: {str(e)}")
-
-            logger.info(
-                f"Superimposition complete. {successful_models} models saved to {output_file}"
+        # Verify we have the same number of atoms
+        if len(biopython_atoms) != len(atoms):
+            logger.warning(
+                f"Warning: BioPython parsed {len(biopython_atoms)} atoms but we extracted {len(atoms)} atoms"
             )
 
-            # Verify the output file exists and has content
-            if output_file.exists():
-                file_size = output_file.stat().st_size
-                logger.info(f"Output file size: {file_size} bytes")
+        # Assign original serial numbers to BioPython atoms
+        for i, atom in enumerate(biopython_atoms):
+            if i < len(atoms):
+                original_serial = atoms[i][0]
+                setattr(atom, "original_serial", original_serial)
+                # Log for debugging
+                logger.debug(
+                    f"Atom {i}: BioPython serial={atom.serial_number}, Original={original_serial}, Name={atom.name}"
+                )
 
-                if file_size == 0:
-                    logger.error("Output file is empty!")
+        return biopython_atoms, conect_dict
+    finally:
+        # Clean up temp file
+        os.unlink(temp_file)
 
-                # Count models in output file
-                output_model_count = count_models_in_pdb(str(output_file))
-                logger.info(f"Output file contains {output_model_count} models")
 
-                if output_model_count <= 1:  # Only reference model
-                    logger.error("Output file only contains the reference model!")
+def calculate_rmsd(coords1: np.ndarray, coords2: np.ndarray) -> float:
+    """Calculate RMSD between two sets of coordinates.
+
+    Args:
+        coords1: First set of coordinates (N x 3)
+        coords2: Second set of coordinates (N x 3)
+
+    Returns:
+        RMSD value
+    """
+    diff = coords1 - coords2
+    return np.sqrt(np.mean(np.sum(diff * diff, axis=1)))
+
+
+def superimpose_coordinates(
+    ref_coords: np.ndarray, mov_coords: np.ndarray
+) -> Tuple[np.ndarray, np.ndarray, float]:
+    """Superimpose one set of coordinates onto another using SVD.
+
+    Args:
+        ref_coords: Reference coordinates (N x 3)
+        mov_coords: Moving coordinates (N x 3)
+
+    Returns:
+        Tuple of (rotation matrix, translation vector, RMSD)
+    """
+    # Center both coordinate sets
+    ref_center = np.mean(ref_coords, axis=0)
+    mov_center = np.mean(mov_coords, axis=0)
+
+    ref_centered = ref_coords - ref_center
+    mov_centered = mov_coords - mov_center
+
+    # Calculate correlation matrix
+    corr = np.dot(mov_centered.T, ref_centered)
+
+    # SVD
+    V, S, Wt = np.linalg.svd(corr)
+
+    # Ensure right-handed coordinate system
+    d = np.sign(np.linalg.det(np.dot(V, Wt)))
+    V[:, -1] *= d
+
+    # Calculate rotation matrix
+    R = np.dot(V, Wt)
+
+    # Calculate translation
+    t = ref_center - np.dot(mov_center, R)
+
+    # Calculate RMSD
+    aligned_coords = np.dot(mov_coords, R) + t
+    rmsd = calculate_rmsd(ref_coords, aligned_coords)
+
+    return R, t, rmsd
+
+
+def check_clashes(
+    coords: np.ndarray, protein_coords: np.ndarray, cutoff: float = 2.0
+) -> Tuple[bool, int]:
+    """Check for steric clashes between a molecule and protein.
+
+    Args:
+        coords: Coordinates to check (N x 3)
+        protein_coords: Protein coordinates (M x 3)
+        cutoff: Distance cutoff for clashes in Angstroms
+
+    Returns:
+        Tuple of (has_clashes, num_clashing_atoms)
+    """
+    num_clashing = 0
+    for coord in coords:
+        dists = np.sqrt(np.sum((protein_coords - coord) ** 2, axis=1))
+        if np.any(dists < cutoff):
+            num_clashing += 1
+    return num_clashing > 0, num_clashing
+
+
+def assign_chain_ids(
+    structure: Structure, logger: Optional[logging.Logger] = None
+) -> None:
+    """Assign chain IDs based on atom connectivity and chemical properties.
+
+    Instead of relying on residue types, this function identifies the ligand
+    based on its connectivity pattern and chemical composition.
+
+    Args:
+        structure: BioPython Structure object
+        logger: Optional logger instance
+    """
+    for model in structure:
+        # First, collect all atoms that aren't part of standard amino acids
+        residue_atoms = {}
+        serial_map = {}  # Map old serial numbers to new ones
+
+        for atom in model.get_atoms():
+            residue = atom.get_parent()
+            # Store original serial number
+            serial_map[atom.serial_number] = atom.serial_number
+
+            if residue.resname not in [
+                "ALA",
+                "CYS",
+                "ASP",
+                "GLU",
+                "PHE",
+                "GLY",
+                "HIS",
+                "ILE",
+                "LYS",
+                "LEU",
+                "MET",
+                "ASN",
+                "PRO",
+                "GLN",
+                "ARG",
+                "SER",
+                "THR",
+                "VAL",
+                "TRP",
+                "TYR",
+            ]:
+                if residue.id not in residue_atoms:
+                    residue_atoms[residue.id] = {"non_protein": [], "residue": residue}
+                residue_atoms[residue.id]["non_protein"].append(atom)
+        else:
+                if residue.id not in residue_atoms:
+                    residue_atoms[residue.id] = {"protein": [], "residue": residue}
+                residue_atoms[residue.id]["protein"].append(atom)
+
+        # Create chain D for non-protein atoms (potential ligand)
+        if any("non_protein" in atoms for atoms in residue_atoms.values()):
+            if "D" not in model:
+                chain_d = Chain("D")
+                model.add(chain_d)
             else:
-                logger.error("Output file does not exist!")
+                chain_d = model["D"]
 
-            return pdb_path, rmsd_values
+            # Move non-protein residues to chain D
+            for res_id, res_data in residue_atoms.items():
+                if "non_protein" in res_data:
+                    # Create a new residue in chain D
+                    new_residue = res_data["residue"].copy()
+                    new_residue.detach_parent()  # Remove old parent reference
+                    chain_d.add(new_residue)
+
+                    # Clear existing atoms from the new residue
+                    for atom in list(new_residue.get_atoms()):
+                        new_residue.detach_child(atom.name)
+
+                    # Add atoms to the new residue and update serial numbers
+                    for atom in res_data["non_protein"]:
+                        if atom.get_parent():
+                            atom.get_parent().detach_child(atom.name)
+                        new_atom = atom.copy()
+                        new_atom.serial_number = (
+                            atom.serial_number
+                        )  # Preserve serial number
+                        serial_map[atom.serial_number] = new_atom.serial_number
+                        new_residue.add(new_atom)
+
+            if logger:
+                logger.info(f"Moved non-protein atoms to chain D")
+
+        # Create chain A for protein atoms if needed
+        if any("protein" in atoms for atoms in residue_atoms.values()):
+            if "A" not in model:
+                chain_a = Chain("A")
+                model.add(chain_a)
+            else:
+                chain_a = model["A"]
+
+            # Move protein residues to chain A
+            for res_id, res_data in residue_atoms.items():
+                if "protein" in res_data:
+                    # Create a new residue in chain A
+                    new_residue = res_data["residue"].copy()
+                    new_residue.detach_parent()  # Remove old parent reference
+                    chain_a.add(new_residue)
+
+                    # Clear existing atoms from the new residue
+                    for atom in list(new_residue.get_atoms()):
+                        new_residue.detach_child(atom.name)
+
+                    # Add atoms to the new residue and update serial numbers
+                    for atom in res_data["protein"]:
+                        if atom.get_parent():
+                            atom.get_parent().detach_child(atom.name)
+                        new_atom = atom.copy()
+                        new_atom.serial_number = (
+                            atom.serial_number
+                        )  # Preserve serial number
+                        serial_map[atom.serial_number] = new_atom.serial_number
+                        new_residue.add(new_atom)
+
+            if logger:
+                logger.info(f"Moved protein atoms to chain A")
+
+        # Update CONECT records based on serial number mapping
+        if hasattr(structure, "original_conect"):
+            new_conect = {}
+            for old_serial, connected in structure.original_conect.items():
+                if old_serial in serial_map:
+                    new_serial = serial_map[old_serial]
+                    new_conect[new_serial] = [
+                        serial_map[s] for s in connected if s in serial_map
+                    ]
+            structure.original_conect = new_conect
+
+
+def parse_reference_data(reference_pdb: str, logger: logging.Logger) -> bool:
+    """Parse and store reference data in an optimized format.
+
+    Args:
+        reference_pdb: Path to reference PDB file
+        logger: Logger instance
+
+    Returns:
+        True if successful, False otherwise
+    """
+    try:
+        # Parse reference PDB file
+        parser = PDBParser(QUIET=True)
+        structure = parser.get_structure("reference", reference_pdb)
+        model = structure[0]
+
+        # Get CONECT records first
+        conect_dict = parse_conect_records(reference_pdb)
+        if not conect_dict:
+            logger.error("No CONECT records found in reference structure")
+            return False
+
+        # Extract ligand chain (D) and create molecular graph
+        if "D" not in model:
+            logger.error("No chain D found in reference structure")
+            return False
+
+        ligand_chain = model["D"]
+        ligand_atoms = list(ligand_chain.get_atoms())
+        ligand_coords = np.array([atom.get_coord() for atom in ligand_atoms])
+
+        # Create molecular graph for ligand
+        ref_ligand_graph = MolecularGraph(
+            ligand_atoms,
+            logger=logger,
+            name="reference",
+            conect_dict=conect_dict,
+            is_reference=True,
+        )
+
+        # Extract protein coordinates (chains A,B,C)
+        protein_coords = []
+        protein_atoms = []
+        for chain_id in ["A", "B", "C"]:
+            if chain_id in model:
+                chain = model[chain_id]
+                for atom in chain.get_atoms():
+                    protein_coords.append(atom.get_coord())
+                    protein_atoms.append(atom)
+
+        if not protein_coords:
+            logger.warning("No protein atoms found in chains A,B,C")
+            protein_coords = np.empty((0, 3))
+        else:
+            protein_coords = np.array(protein_coords)
+
+        # Cache reference data
+        _REFERENCE_DATA["target_protein_coords"] = protein_coords
+        _REFERENCE_DATA["ref_ligand_graph"] = ref_ligand_graph
+        _REFERENCE_DATA["ref_ligand_coords"] = ligand_coords
+        _REFERENCE_DATA["ref_conect"] = conect_dict
+
+        # Log success with details
+        logger.info(f"Successfully cached reference data:")
+        logger.info(f"- Protein atoms: {len(protein_coords)}")
+        logger.info(f"- Ligand atoms: {len(ligand_atoms)}")
+        logger.info(f"- CONECT records: {len(conect_dict)}")
+        return True
 
     except Exception as e:
-        logger.error(f"Error processing {pdb_path}: {str(e)}")
-        logger.exception(e)  # Log full traceback
+        logger.error(f"Failed to parse reference data: {str(e)}")
+        return False
+
+
+def process_model(
+    test_compound: Structure, model_idx: int, logger: logging.Logger
+) -> Optional[Dict[str, Any]]:
+    """Process a single test compound model.
+
+    This function reuses isomorphic mappings for subsequent models of the same compound.
+
+    Args:
+        test_compound: BioPython Structure object for the test compound
+        model_idx: Model index in trajectory
+        logger: Logger instance
+
+    Returns:
+        Dictionary with alignment results or None if failed
+    """
+    try:
+        # Get compound ID from structure
+        compound_id = test_compound._id
+
+        # Check if we have cached isomorphic mapping
+        if model_idx == 0 or compound_id not in _ISOMORPHIC_CACHE:
+            # First model or new compound - need to find isomorphic mapping
+            logger.info(f"Finding isomorphic mapping for compound {compound_id}")
+
+            # Parse CONECT records and create molecular graph
+            test_conect = parse_conect_records(compound_id)
+            if not test_conect:
+                logger.error(f"No CONECT records found for test compound {compound_id}")
+                return None
+
+            # Assign atoms to chains
+            assign_chain_ids(test_compound, logger)
+
+            # Get chain D (non-protein atoms)
+            model = test_compound[0]
+            if "D" not in model:
+                logger.warning(
+                    f"No non-protein atoms found to match in model {model_idx}"
+                )
+                return None
+
+            test_chain = model["D"]
+            test_atoms = list(test_chain.get_atoms())
+            if not test_atoms:
+                logger.warning(
+                    f"No atoms found in non-protein chain in model {model_idx}"
+                )
+                return None
+
+            # Create molecular graph for test compound
+            test_graph = MolecularGraph(
+                test_atoms, logger=logger, name="test_compound", conect_dict=test_conect
+            )
+
+            # Find isomorphic mapping
+            superimposer = IsomorphicSuperimposer(logger)
+            result = superimposer.align(_REFERENCE_DATA["ref_ligand_graph"], test_graph)
+
+            if not result.isomorphic_match:
+                logger.warning(f"No matching substructure found in model {model_idx}")
+                return None
+
+            # Cache the mapping and atom indices for future models
+            _ISOMORPHIC_CACHE[compound_id] = {
+                "matched_pairs": result.matched_pairs,
+                "test_atoms": test_atoms,
+                "test_atom_indices": [atom.serial_number for atom in test_atoms],
+            }
+
+        # Get cached mapping
+        cached = _ISOMORPHIC_CACHE[compound_id]
+        matched_pairs = cached["matched_pairs"]
+        test_atoms = cached["test_atoms"]
+
+        # Create mapping from reference atom index to matched test atom
+        ref_to_test = {}
+        for ref_atom, test_atom in matched_pairs:
+            ref_idx = _REFERENCE_DATA["ref_ligand_graph"].atoms.index(ref_atom)
+            ref_to_test[ref_idx] = test_atom
+
+        # Get coordinates for matched atoms
+        ref_coords = []
+        test_coords = []
+        for i, ref_atom in enumerate(_REFERENCE_DATA["ref_ligand_graph"].atoms):
+            if i in ref_to_test:
+                ref_coords.append(ref_atom.coord)
+                test_coords.append(ref_to_test[i].coord)
+
+        ref_coords = np.array(ref_coords)
+        test_coords = np.array(test_coords)
+
+        # Calculate optimal transformation
+        rotation, translation = calculate_optimal_transform(
+            ref_coords, test_coords, logger
+        )
+
+        # Apply transformation to matched atoms to get RMSD
+        test_coords_transformed = np.dot(test_coords, rotation.T) + translation
+        matched_rmsd = calculate_rmsd(ref_coords, test_coords_transformed)
+
+        if logger:
+            logger.info(f"RMSD for matched atoms: {matched_rmsd:.4f} Å")
+
+        # Apply transformation to all test atoms for clash detection
+        all_test_coords = np.array([atom.get_coord() for atom in test_atoms])
+        transformed_coords = np.dot(all_test_coords, rotation.T) + translation
+
+        # Check for clashes with protein
+        has_clashes, num_clashing = False, 0
+        if len(_REFERENCE_DATA["target_protein_coords"]) > 0:
+            has_clashes, num_clashing = check_clashes(
+                transformed_coords, _REFERENCE_DATA["target_protein_coords"]
+            )
+            if logger and has_clashes:
+                logger.warning(f"Detected {num_clashing} atoms with protein clashes")
+
+        return {
+            "rmsd": float(matched_rmsd),  # RMSD of matched atoms only
+            "matched_atoms": len(matched_pairs),
+            "has_clashes": has_clashes,
+            "num_clashing": num_clashing,
+            "rotation": rotation.tolist(),
+            "translation": translation.tolist(),
+        }
+
+    except Exception as e:
+        logger.error(f"Failed to process test compound model {model_idx}: {str(e)}")
         return None
 
 
-def find_trajectory_pdbs(base_dir: str) -> List[str]:
-    """Find all md_Ref.pdb files in the directory structure.
+def calculate_optimal_transform(
+    ref_coords: np.ndarray,
+    mov_coords: np.ndarray,
+    logger: Optional[logging.Logger] = None,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Calculate optimal rotation and translation using Kabsch algorithm.
 
     Args:
-        base_dir: Base directory to search
+        ref_coords: Reference coordinates (N x 3)
+        mov_coords: Moving coordinates (N x 3)
+        logger: Optional logger instance
 
     Returns:
-        List of paths to PDB files
+        Tuple of (rotation matrix, translation vector)
     """
-    base_path = Path(base_dir)
-    pdb_files = list(base_path.rglob("md_Ref.pdb"))
-    return [str(path) for path in pdb_files]
+    if logger:
+        logger.info("\nStarting optimal transform calculation:")
+        logger.info(f"Reference coordinates shape: {ref_coords.shape}")
+        logger.info(f"Moving coordinates shape: {mov_coords.shape}")
+        logger.info("\nInitial coordinates:")
+        for i, (ref, mov) in enumerate(zip(ref_coords, mov_coords)):
+            logger.info(f"Atom {i}:")
+            logger.info(f"  Reference: {ref}")
+            logger.info(f"  Moving:    {mov}")
+            logger.info(f"  Distance:  {np.linalg.norm(ref - mov):.4f} Å")
+
+    # Center both coordinate sets
+    ref_center = np.mean(ref_coords, axis=0)
+    mov_center = np.mean(mov_coords, axis=0)
+
+    if logger:
+        logger.info(f"\nReference center: {ref_center}")
+        logger.info(f"Moving center: {mov_center}")
+        logger.info(f"Center distance: {np.linalg.norm(ref_center - mov_center):.4f} Å")
+
+    ref_centered = ref_coords - ref_center
+    mov_centered = mov_coords - mov_center
+
+    if logger:
+        logger.info("\nAfter centering:")
+        for i, (ref, mov) in enumerate(zip(ref_centered, mov_centered)):
+            logger.info(f"Atom {i}:")
+            logger.info(f"  Reference: {ref}")
+            logger.info(f"  Moving:    {mov}")
+            logger.info(f"  Distance:  {np.linalg.norm(ref - mov):.4f} Å")
+
+    # Calculate correlation matrix
+    corr = np.dot(mov_centered.T, ref_centered)
+
+    if logger:
+        logger.info(f"\nCorrelation matrix:\n{corr}")
+
+    # SVD
+    V, S, Wt = np.linalg.svd(corr)
+
+    if logger:
+        logger.info(f"\nSVD components:")
+        logger.info(f"V:\n{V}")
+        logger.info(f"S: {S}")
+        logger.info(f"Wt:\n{Wt}")
+
+    # Ensure right-handed coordinate system
+    d = np.sign(np.linalg.det(np.dot(V, Wt)))
+    V[:, -1] *= d
+
+    # Calculate rotation matrix
+    rotation = np.dot(V, Wt)
+
+    # Calculate translation
+    translation = ref_center - np.dot(mov_center, rotation)
+
+    if logger:
+        logger.info(f"\nFinal transformation:")
+        logger.info(f"Rotation matrix:\n{rotation}")
+        logger.info(f"Translation vector: {translation}")
+
+        # Test transformation
+        mov_transformed = np.dot(mov_coords, rotation.T) + translation
+        rmsd = np.sqrt(np.mean(np.sum((ref_coords - mov_transformed) ** 2, axis=1)))
+        logger.info(f"\nRMSD after transformation: {rmsd:.4f} Å")
+
+        logger.info("\nFinal coordinates:")
+        for i, (ref, mov) in enumerate(zip(ref_coords, mov_transformed)):
+            logger.info(f"Atom {i}:")
+            logger.info(f"  Reference: {ref}")
+            logger.info(f"  Transformed: {mov}")
+            logger.info(f"  Distance: {np.linalg.norm(ref - mov):.4f} Å")
+
+    return rotation, translation
+
+
+def process_trajectory(args: Tuple[str, str, bool, Dict[str, Any]]) -> Optional[Dict]:
+    """Process a single trajectory file.
+
+    Args:
+        args: Tuple containing (pdb_file, base_dir, verbose, reference_data)
+
+    Returns:
+        Dictionary of model metrics or None if failed
+    """
+    pdb_file, base_dir, verbose, reference_data = args
+
+    # Set up logging for this process
+    logger = setup_logging(verbose)
+
+    try:
+        # Initialize reference data for this process
+        global _REFERENCE_DATA
+        _REFERENCE_DATA = reference_data
+
+        # Get number of models
+        model_count = count_models_in_pdb(pdb_file)
+        logger.info(f"Processing {model_count} models from {pdb_file}")
+
+        # Create metrics file path
+        metrics_file = Path(pdb_file).parent / "superimposition_metrics.json"
+        metrics = {}
+
+        # Load existing metrics if file exists
+        if metrics_file.exists():
+            try:
+                with open(metrics_file, "r") as f:
+                    metrics = json.load(f)
+            except json.JSONDecodeError:
+                logger.warning(f"Could not read existing metrics file: {metrics_file}")
+
+        # Parse structure
+        parser = PDBParser(QUIET=True)
+        structure = parser.get_structure(pdb_file, pdb_file)  # Use pdb_file as ID
+        model_count = len(structure)
+        logger.info(f"Processing {model_count} models from {pdb_file}")
+
+        # Process each model
+        with tqdm(total=model_count, desc="Models", unit="model") as pbar:
+            for model_idx, model in enumerate(structure):
+                # Skip if already processed
+                if str(model_idx + 1) in metrics:
+                    pbar.update(1)
+                    continue
+
+                # Create a new structure for this model
+                model_structure = Structure(pdb_file)  # Use pdb_file as ID
+                model_structure.add(model)
+                model_structure._id = pdb_file  # Set _id for CONECT record parsing
+
+                # Superimpose model
+                result = process_model(model_structure, model_idx, logger)
+                if result:
+                    metrics[str(model_idx + 1)] = result
+
+                    # Update progress bar
+                    pbar.set_postfix(
+                        {
+                            "RMSD": f"{result['rmsd']:.4f}",
+                            "Clashes": result["has_clashes"],
+                        }
+                    )
+
+                    # Save metrics after each model
+                    with open(metrics_file, "w") as f:
+                        json.dump(metrics, f, indent=2)
+
+                pbar.update(1)
+
+        return metrics
+
+    except Exception as e:
+        logger.error(f"Failed to process {pdb_file}: {str(e)}")
+        return None
 
 
 def main():
-    """Main function for superimposing trajectories."""
+    """Main function."""
     parser = argparse.ArgumentParser(
-        description="Superimpose converted MD trajectories to a reference structure"
+        description="Superimpose ligands onto a reference structure using RDKit MCS."
     )
+    parser.add_argument("base_dir", help="Base directory containing md_Ref.pdb files")
     parser.add_argument(
-        "base_dir", type=str, help="Base directory containing md_Ref.pdb files"
-    )
-    parser.add_argument("reference_pdb", type=str, help="Path to reference PDB file")
-    parser.add_argument(
-        "--output-dir",
-        type=str,
-        default="superimposed",
-        help="Directory for output files",
+        "reference_pdb",
+        help="Reference PDB file with protein (chains A,B,C) and ligand (chain D)",
     )
     parser.add_argument(
         "--num-processes",
         type=int,
-        default=1,  # Default to 1 process to enable caching
-        help="Number of parallel processes to use",
+        default=None,
+        help="Number of parallel processes (default: number of CPU cores)",
     )
     parser.add_argument(
         "--force",
         action="store_true",
-        help="Force reprocessing of already superimposed trajectories",
+        help="Force reprocessing of already processed files",
     )
-    parser.add_argument(
-        "--verbose", action="store_true", help="Show detailed processing information"
-    )
-    parser.add_argument(
-        "--debug", action="store_true", help="Show extremely detailed debug information"
-    )
-    # Add trajectory frame selection arguments
-    parser.add_argument(
-        "--start",
-        type=int,
-        default=None,
-        help="Starting model index (0-indexed, inclusive)",
-    )
-    parser.add_argument(
-        "--stop",
-        type=int,
-        default=None,
-        help="Ending model index (exclusive)",
-    )
-    parser.add_argument(
-        "--stride",
-        type=int,
-        default=None,
-        help="Step size for selecting models",
-    )
-    # New option to enable multi-processing (which disables caching)
-    parser.add_argument(
-        "--multi-process",
-        action="store_true",
-        help="Enable parallel processing (disables reference data caching)",
-    )
+    parser.add_argument("--verbose", action="store_true", help="Enable verbose output")
 
     args = parser.parse_args()
 
     # Set up logging
-    log_level = "debug" if args.debug else (True if args.verbose else False)
-    logger = setup_logging(log_level)
+    logging.basicConfig(
+        level=logging.INFO if args.verbose else logging.WARNING,
+        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    )
+    logger = logging.getLogger("superimpose")
 
-    logger.info("=== Starting superimposition process ===")
-    logger.info(f"Reference PDB: {args.reference_pdb}")
-
-    # Check if reference file exists
-    if not os.path.exists(args.reference_pdb):
-        logger.error(f"Reference PDB file not found: {args.reference_pdb}")
+    # Initialize reference data
+    print("\nInitializing reference structures...")
+    if not parse_reference_data(args.reference_pdb, logger):
         return
 
-    # Find all trajectory PDB files
-    logger.info(f"Searching for trajectory files in {args.base_dir}...")
-    pdb_files = find_trajectory_pdbs(args.base_dir)
+    # Find trajectory files
+    print(f"\nSearching for md_Ref.pdb files in {args.base_dir}...")
+    base_path = Path(args.base_dir)
+    pdb_files = list(base_path.rglob("md_Ref.pdb"))
+    pdb_files = [str(path) for path in pdb_files]
 
     if not pdb_files:
-        logger.error(f"No md_Ref.pdb files found in {args.base_dir}")
+        print(f"No md_Ref.pdb files found in {args.base_dir}")
         return
 
-    logger.info(f"Found {len(pdb_files)} md_Ref.pdb files")
+    print(f"Found {len(pdb_files)} files to process")
 
-    # Create output directory
-    output_dir = Path(args.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
+    # Set number of processes
+    num_processes = args.num_processes or min(os.cpu_count() or 1, len(pdb_files))
+    print(f"Using {num_processes} processes")
 
-    # Set number of processes based on args
-    num_processes = args.num_processes
-    if args.multi_process:
-        logger.info(
-            f"Using multi-processing with {num_processes} processes (reference data caching disabled)"
-        )
-    else:
-        num_processes = 1
-        logger.info("Using single process to enable reference data caching")
-
-    # Try processing single-threaded first if debugging
-    if args.debug:
-        logger.info("Running in debug mode with single thread")
-        for pdb_file in pdb_files:
-            logger.info(f"Processing {pdb_file}...")
-            result = superimpose_trajectory(
-                (
-                    pdb_file,
-                    args.reference_pdb,
-                    args.output_dir,
-                    "debug",
-                    args.start,
-                    args.stop,
-                    args.stride,
-                    args.force,
-                )
-            )
-            if result:
-                pdb_path, rmsd_values = result
-                # Calculate average RMSD
-                avg_rmsd = np.mean([info["rmsd"] for info in rmsd_values.values()])
-                logger.info(f"Completed {pdb_path} with average RMSD: {avg_rmsd:.4f}")
-        return
-
-    # Process files in parallel for normal mode
-    with tqdm(total=len(pdb_files), unit="file") as pbar:
+    # Process files in parallel
+    with tqdm(total=len(pdb_files), desc="Files", unit="file") as pbar:
         with ProcessPoolExecutor(max_workers=num_processes) as executor:
             futures = []
 
             for pdb_file in pdb_files:
-                # Check if already processed and not forcing reprocessing
-                rel_path = Path(pdb_file).relative_to(Path(pdb_file).parent.parent)
-                output_file = output_dir / f"{rel_path.stem}_superimposed.pdb"
-                rmsd_file = output_dir / f"{rel_path.stem}_rmsd.json"
-
-                if not args.force and output_file.exists() and rmsd_file.exists():
+                if not args.force:
+                    metrics_file = (
+                        Path(pdb_file).parent / "superimposition_metrics.json"
+                    )
+                    if metrics_file.exists():
                     pbar.update(1)
                     continue
 
                 futures.append(
                     executor.submit(
-                        superimpose_trajectory,
-                        (
-                            pdb_file,
-                            args.reference_pdb,
-                            args.output_dir,
-                            args.verbose,
-                            args.start,
-                            args.stop,
-                            args.stride,
-                            args.force,
-                        ),
+                        process_trajectory,
+                        (pdb_file, args.base_dir, args.verbose, _REFERENCE_DATA),
                     )
                 )
 
@@ -1685,14 +1757,78 @@ def main():
                 pbar.update(1)
 
                 if result:
-                    pdb_path, rmsd_values = result
-                    # Calculate average RMSD
-                    avg_rmsd = np.mean([info["rmsd"] for info in rmsd_values.values()])
-                    logger.info(
-                        f"Completed {pdb_path} with average RMSD: {avg_rmsd:.4f}"
+                    avg_rmsd = np.mean([m["rmsd"] for m in result.values()])
+                    clashes = sum(1 for m in result.values() if m["has_clashes"])
+                    pbar.set_postfix(
+                        {
+                            "Avg RMSD": f"{avg_rmsd:.4f}",
+                            "Clashes": f"{clashes}/{len(result)}",
+                        }
                     )
 
-    logger.info("Superimposition complete!")
+    print("\nSuperimposition complete!")
+
+
+def create_rdkit_mol_from_chain(
+    chain: Chain, conect_dict: Dict[int, List[int]], logger: logging.Logger
+) -> Optional[rdkit.Chem.Mol]:
+    """Create an RDKit molecule from a BioPython chain and CONECT records.
+
+    Args:
+        chain: BioPython Chain object
+        conect_dict: Dictionary of CONECT records
+        logger: Logger instance
+
+    Returns:
+        RDKit molecule or None if failed
+    """
+    try:
+        # Create empty RDKit molecule
+        mol = Chem.RWMol()
+
+        # Map from atom serial numbers to RDKit atom indices
+        serial_to_idx = {}
+
+        # Add atoms
+        for residue in chain:
+            for atom in residue:
+                # Get element from atom name (strip numbers)
+                element = "".join(c for c in atom.name if not c.isdigit()).strip()
+                if element not in ["C", "N", "O", "S", "P", "H"]:
+                    element = "C"  # Default to carbon for unknown elements
+
+                # Add atom to molecule
+                rdkit_atom = Chem.Atom(element)
+                idx = mol.AddAtom(rdkit_atom)
+                serial_to_idx[atom.serial_number] = idx
+
+        # Add bonds from CONECT records
+        bonds_added = set()
+        for serial, connected in conect_dict.items():
+            if serial in serial_to_idx:
+                atom1_idx = serial_to_idx[serial]
+                for connected_serial in connected:
+                    if connected_serial in serial_to_idx:
+                        atom2_idx = serial_to_idx[connected_serial]
+                        # Avoid adding the same bond twice
+                        bond_key = tuple(sorted([atom1_idx, atom2_idx]))
+                        if bond_key not in bonds_added:
+                            mol.AddBond(atom1_idx, atom2_idx, Chem.BondType.SINGLE)
+                            bonds_added.add(bond_key)
+
+        # Convert to non-editable molecule
+        mol = mol.GetMol()
+
+        # Calculate valence and add hydrogens
+        for atom in mol.GetAtoms():
+            atom.UpdatePropertyCache(strict=False)
+        mol = Chem.AddHs(mol)
+
+        return mol
+
+    except Exception as e:
+        logger.error(f"Failed to create RDKit molecule: {str(e)}")
+        return None
 
 
 if __name__ == "__main__":

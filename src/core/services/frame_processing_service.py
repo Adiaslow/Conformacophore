@@ -8,6 +8,7 @@ import numpy as np
 from ..domain.models.pdb_frame import PDBFrame
 from .alignment_service import AlignmentService
 from ...infrastructure.repositories.structure_repository import StructureRepository
+from ..domain.models.atom import Atom
 
 
 class FrameProcessingService:
@@ -103,16 +104,27 @@ class FrameProcessingService:
 
             # Write transformed coordinates
             for i, atom in enumerate(frame.atoms):
-                coords = np.array([atom["x"], atom["y"], atom["z"]])
+                # Convert dictionary atom to Atom object
+                atom_obj = Atom(
+                    atom_id=atom["atom_num"],
+                    element=atom["element"],
+                    coordinates=(atom["x"], atom["y"], atom["z"]),
+                    residue_name=atom["residue_name"],
+                    residue_id=atom["residue_num"],
+                    chain_id=atom["chain_id"],
+                    atom_name=atom["atom_name"],
+                    serial=atom["atom_num"],
+                )
+
                 # Apply transformation
-                new_coords = np.dot(coords, rotation.T) + translation
+                new_coords = np.dot(atom_obj.coordinates, rotation.T) + translation
 
                 # Format PDB ATOM record
                 f.write(
-                    f"ATOM  {i+1:5d} {atom['atom_name']:^4s} {atom['residue_name']:3s} "
-                    f"{atom['chain_id']}{atom['residue_num']:4d}    "
+                    f"ATOM  {i+1:5d} {atom_obj.atom_name:^4s} {atom_obj.residue_name:3s} "
+                    f"{atom_obj.chain_id}{atom_obj.residue_id:4d}    "
                     f"{new_coords[0]:8.3f}{new_coords[1]:8.3f}{new_coords[2]:8.3f}"
-                    f"  1.00  0.00          {atom['atom_name'][0]:>2s}\n"
+                    f"  1.00  0.00          {atom_obj.atom_name[0]:>2s}\n"
                 )
 
             # Write connectivity if available

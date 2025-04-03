@@ -4,6 +4,7 @@ import shutil
 from typing import List, Dict
 import argparse
 
+
 class PDBHeaderHandler:
     """Handles reading and writing of PDB header information."""
 
@@ -18,11 +19,19 @@ class PDBHeaderHandler:
 
         # Header keywords to capture
         header_keywords = [
-            'HEADER', 'TITLE', 'COMPND', 'SOURCE', 'KEYWDS',
-            'EXPDTA', 'AUTHOR', 'REVDAT', 'REMARK', 'SEQRES'
+            "HEADER",
+            "TITLE",
+            "COMPND",
+            "SOURCE",
+            "KEYWDS",
+            "EXPDTA",
+            "AUTHOR",
+            "REVDAT",
+            "REMARK",
+            "SEQRES",
         ]
 
-        with open(pdb_path, 'r') as f:
+        with open(pdb_path, "r") as f:
             lines = f.readlines()
 
         # First pass: capture global headers before any MODEL
@@ -30,7 +39,7 @@ class PDBHeaderHandler:
             if any(line.startswith(keyword) for keyword in header_keywords):
                 self.headers.append(line)
 
-            if line.startswith('MODEL'):
+            if line.startswith("MODEL"):
                 break
 
         # Second pass: capture model-specific headers
@@ -38,18 +47,20 @@ class PDBHeaderHandler:
         reading_model = False
 
         for line in lines:
-            if line.startswith('MODEL'):
+            if line.startswith("MODEL"):
                 current_model += 1
                 reading_model = True
                 self.model_headers[current_model] = []
 
-            elif line.startswith('ENDMDL'):
+            elif line.startswith("ENDMDL"):
                 reading_model = False
 
             elif reading_model:
                 # Capture model-specific headers
-                if any(line.startswith(keyword) for keyword in
-                       ['COMPND', 'REMARK', 'SEQRES']):
+                if any(
+                    line.startswith(keyword)
+                    for keyword in ["COMPND", "REMARK", "SEQRES"]
+                ):
                     self.model_headers[current_model].append(line)
 
         # If no models found, treat all headers as global
@@ -68,11 +79,12 @@ class PDBHeaderHandler:
             for header in self.model_headers[model_num]:
                 file_handle.write(header)
 
+
 def filter_results(
     input_dir: str,
     output_dir: str,
     rmsd_threshold: float,
-    clash_percentage_threshold: float
+    clash_percentage_threshold: float,
 ) -> None:
     """
     Filter superimposition results based on RMSD and percentage of clashing conformers.
@@ -96,7 +108,7 @@ def filter_results(
 
     # Process each compound
     for _, row in summary_df.iterrows():
-        compound_id = row['Compound']
+        compound_id = row["Compound"]
         compound_csv = os.path.join(input_dir, f"{compound_id}_results.csv")
 
         if not os.path.exists(compound_csv):
@@ -108,20 +120,21 @@ def filter_results(
 
         # Calculate percentage of conformers with clashes
         total_conformers = len(compound_df)
-        clashing_conformers = compound_df['Has_Clashes'].sum()
+        clashing_conformers = compound_df["Has_Clashes"].sum()
         clash_percentage = (clashing_conformers / total_conformers) * 100
 
         # First filter: Check if compound meets clash percentage threshold
         if clash_percentage <= clash_percentage_threshold:
             # Second filter: Get only non-clashing conformers that meet RMSD threshold
             filtered_df = compound_df[
-                (~compound_df['Has_Clashes']) &
-                (compound_df['RMSD'] <= rmsd_threshold)
+                (~compound_df["Has_Clashes"]) & (compound_df["RMSD"] <= rmsd_threshold)
             ]
 
             if len(filtered_df) > 0:
                 # Save filtered compound results
-                filtered_df.to_csv(os.path.join(output_dir, f"{compound_id}_results.csv"), index=False)
+                filtered_df.to_csv(
+                    os.path.join(output_dir, f"{compound_id}_results.csv"), index=False
+                )
 
                 # Copy corresponding PDB files with headers preserved
                 compound_dir = os.path.join(input_dir, str(compound_id))
@@ -129,7 +142,7 @@ def filter_results(
                 os.makedirs(filtered_output_dir, exist_ok=True)
 
                 for _, model_row in filtered_df.iterrows():
-                    model_num = model_row['Model']
+                    model_num = model_row["Model"]
                     pdb_name = f"aligned_conf_{model_num}.pdb"
                     src_path = os.path.join(compound_dir, pdb_name)
                     if os.path.exists(src_path):
@@ -139,7 +152,9 @@ def filter_results(
 
                         # Write to new file with headers preserved
                         dest_path = os.path.join(filtered_output_dir, pdb_name)
-                        with open(src_path, 'r') as src_file, open(dest_path, 'w') as dest_file:
+                        with open(src_path, "r") as src_file, open(
+                            dest_path, "w"
+                        ) as dest_file:
                             # Write global headers
                             header_handler.write_headers(dest_file)
 
@@ -149,7 +164,7 @@ def filter_results(
                             # Copy the rest of the file (contents after headers)
                             model_started = False
                             for line in src_file:
-                                if line.startswith(f'MODEL        {model_num}'):
+                                if line.startswith(f"MODEL        {model_num}"):
                                     model_started = True
 
                                 if model_started:
@@ -157,21 +172,24 @@ def filter_results(
 
                 # Calculate new summary statistics for this compound
                 summary_stats = {
-                    'Compound': compound_id,
-                    'Sequence': row['Sequence'],
-                    'Original_Num_Conformers': total_conformers,
-                    'Original_Clash_Percentage': clash_percentage,
-                    'Filtered_Num_Conformers': len(filtered_df),
-                    'Min_RMSD': filtered_df['RMSD'].min(),
-                    'Max_RMSD': filtered_df['RMSD'].max(),
-                    'Mean_RMSD': filtered_df['RMSD'].mean(),
-                    'Median_RMSD': filtered_df['RMSD'].median(),
-                    'StdDev_RMSD': filtered_df['RMSD'].std(),
-                    'Min_Matched_Atoms': filtered_df['Matched_Atoms'].min(),
-                    'Max_Matched_Atoms': filtered_df['Matched_Atoms'].max(),
-                    'Best_RMSD_Model': filtered_df.loc[filtered_df['RMSD'].idxmin(), 'Model'],
-                    'Best_RMSD_Frame': filtered_df.loc[filtered_df['RMSD'].idxmin(), 'Frame'],
-                    'Min_Distance_Overall': filtered_df['Min_Distance'].min()
+                    "Compound": compound_id,
+                    "Sequence": row["Sequence"],
+                    "Original_Num_Conformers": total_conformers,
+                    "Original_Clash_Percentage": clash_percentage,
+                    "Filtered_Num_Conformers": len(filtered_df),
+                    "Min_RMSD": filtered_df["RMSD"].min(),
+                    "Max_RMSD": filtered_df["RMSD"].max(),
+                    "Mean_RMSD": filtered_df["RMSD"].mean(),
+                    "Median_RMSD": filtered_df["RMSD"].median(),
+                    "StdDev_RMSD": filtered_df["RMSD"].std(),
+                    "Min_Matched_Atoms": filtered_df["Matched_Atoms"].min(),
+                    "Max_Matched_Atoms": filtered_df["Matched_Atoms"].max(),
+                    "Best_RMSD_Model": filtered_df.loc[
+                        filtered_df["RMSD"].idxmin(), "Model"
+                    ],
+                    "Best_RMSD_Frame": filtered_df.loc[
+                        filtered_df["RMSD"].idxmin(), "Frame"
+                    ],
                 }
 
                 filtered_compounds.append(summary_stats)
@@ -181,45 +199,60 @@ def filter_results(
                 print(f"Original conformers: {total_conformers}")
                 print(f"Original clash percentage: {clash_percentage:.1f}%")
                 print(f"Filtered clash-free conformers: {len(filtered_df)}")
-                print(f"RMSD range: {summary_stats['Min_RMSD']:.4f} - {summary_stats['Max_RMSD']:.4f}")
+                print(
+                    f"RMSD range: {summary_stats['Min_RMSD']:.4f} - {summary_stats['Max_RMSD']:.4f}"
+                )
         else:
-            print(f"\nSkipping compound {compound_id} - clash percentage {clash_percentage:.1f}% exceeds threshold {clash_percentage_threshold}%")
+            print(
+                f"\nSkipping compound {compound_id} - clash percentage {clash_percentage:.1f}% exceeds threshold {clash_percentage_threshold}%"
+            )
 
     # Create new summary statistics file
     if filtered_compounds:
         filtered_summary_df = pd.DataFrame(filtered_compounds)
-        filtered_summary_df.to_csv(os.path.join(output_dir, "summary_statistics.csv"), index=False)
+        filtered_summary_df.to_csv(
+            os.path.join(output_dir, "summary_statistics.csv"), index=False
+        )
         print(f"\nFiltered {len(filtered_compounds)} compounds saved to {output_dir}")
 
         # Print overall statistics
         print("\nOverall statistics for filtered dataset:")
         print(f"Total compounds: {len(filtered_compounds)}")
-        print(f"Average number of conformers per compound: {filtered_summary_df['Filtered_Num_Conformers'].mean():.1f}")
+        print(
+            f"Average number of conformers per compound: {filtered_summary_df['Filtered_Num_Conformers'].mean():.1f}"
+        )
         print(f"Average RMSD: {filtered_summary_df['Mean_RMSD'].mean():.4f}")
     else:
         print("\nNo compounds met the filtering criteria")
 
+
 def main():
-    parser = argparse.ArgumentParser(description='Filter superimposition results based on RMSD and clash percentage thresholds')
-    parser.add_argument('input_dir', help='Directory containing original superimposition results')
-    parser.add_argument('output_dir', help='Directory to store filtered results')
-    parser.add_argument('--rmsd', type=float, required=True, help='Maximum allowed RMSD')
-    parser.add_argument('--clash-percent', type=float, required=True,
-                       help='Maximum allowed percentage of conformers with clashes (0-100)')
+    parser = argparse.ArgumentParser(
+        description="Filter superimposition results based on RMSD and clash percentage thresholds"
+    )
+    parser.add_argument(
+        "input_dir", help="Directory containing original superimposition results"
+    )
+    parser.add_argument("output_dir", help="Directory to store filtered results")
+    parser.add_argument(
+        "--rmsd", type=float, required=True, help="Maximum allowed RMSD"
+    )
+    parser.add_argument(
+        "--clash-percent",
+        type=float,
+        required=True,
+        help="Maximum allowed percentage of conformers with clashes (0-100)",
+    )
 
     args = parser.parse_args()
 
     if not 0 <= args.clash_percent <= 100:
         parser.error("Clash percentage must be between 0 and 100")
 
-    filter_results(
-        args.input_dir,
-        args.output_dir,
-        args.rmsd,
-        args.clash_percent
-    )
+    filter_results(args.input_dir, args.output_dir, args.rmsd, args.clash_percent)
 
-if __name__ == '__main__':
+
+if __name__ == "__main__":
     main()
 
 """

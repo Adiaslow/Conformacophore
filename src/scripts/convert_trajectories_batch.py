@@ -180,14 +180,6 @@ def process_trajectory(
             n_frames = traj_info.get("n_frames", 0)
             n_atoms = traj_info.get("n_atoms", 0)
 
-            # Write initial conversion summary
-            write_conversion_summary(
-                output_dir,
-                xtc_path,
-                n_frames=n_frames,
-                n_atoms=n_atoms,
-            )
-
             # Apply frame selection parameters
             start_frame = 0 if start is None else start
             end_frame = None if stop is None else stop
@@ -202,6 +194,21 @@ def process_trajectory(
                 start=start_frame,
                 end=end_frame,
                 stride=stride_value,
+            )
+
+            # Count actual frames in output PDB
+            frame_count = 0
+            with open(output_files[0], "r") as f:
+                for line in f:
+                    if line.startswith("MODEL"):
+                        frame_count += 1
+
+            # Write conversion summary after successful conversion
+            write_conversion_summary(
+                output_dir,
+                xtc_path,
+                n_frames=frame_count,
+                n_atoms=n_atoms,
             )
 
             return None

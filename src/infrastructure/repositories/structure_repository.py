@@ -10,6 +10,7 @@ from ...core.interfaces.repository import Repository
 from ...core.domain.models.molecular_graph import MolecularGraph
 from ...core.domain.models.pdb_frame import PDBFrameCollection
 from ...core.domain.models.compound_metadata import CompoundRegistry, CompoundMetadata
+from ...core.domain.models.atom import Atom
 
 
 class StructureRepository(Repository[MolecularGraph]):
@@ -117,21 +118,28 @@ class StructureRepository(Repository[MolecularGraph]):
             if not atoms:
                 return None
 
-        # Create graph from atoms and connectivity
-        atoms = [
-            {
-                **atom,
-                "coords": np.array([atom["x"], atom["y"], atom["z"]]),
-            }
-            for atom in atoms
-        ]
+        # Convert dictionary atoms to Atom objects
+        atom_objects = []
+        for atom in atoms:
+            atom_objects.append(
+                Atom(
+                    atom_id=atom["atom_num"],
+                    element=atom["element"],
+                    coordinates=(atom["x"], atom["y"], atom["z"]),
+                    residue_name=atom["residue_name"],
+                    residue_id=atom["residue_num"],
+                    chain_id=atom["chain_id"],
+                    atom_name=atom["atom_name"],
+                    serial=atom["atom_num"],
+                )
+            )
 
         # Create graph with atoms as nodes
-        graph = MolecularGraph(atoms)
+        graph = MolecularGraph(atom_objects)
 
         # Add connectivity from CONECT records
         # Only add connections between atoms in the selected chain
-        atom_indices = {atom["atom_num"]: i for i, atom in enumerate(atoms)}
+        atom_indices = {atom.serial: i for i, atom in enumerate(atom_objects)}
         for connection in frame.connectivity:
             if len(connection) >= 2:
                 # Convert PDB atom numbers to our indices

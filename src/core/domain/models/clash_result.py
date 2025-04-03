@@ -11,4 +11,3 @@ class ClashResult:
     has_clashes: bool
     num_clashes: int
     clash_pairs: List[Tuple]
-    min_distance: float

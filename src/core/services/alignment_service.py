@@ -35,43 +35,11 @@ class AlignmentService:
         Returns:
             AlignmentResult containing alignment metrics and transformation
         """
-        # Get coordinates
-        ref_coords = reference.get_coordinates()
-        target_coords = target.get_coordinates()
+        # Use the configured superimposer to align structures
+        result = self._superimposer.align(reference, target)
 
-        # Match atoms based on name only (ignore residue name for now)
-        matched_pairs = []
-        used_target_indices = set()
-
-        logger = logging.getLogger(__name__)
-        logger.debug("Starting atom matching")
-        logger.debug(
-            f"Reference atoms: {len(reference.atoms)}, Target atoms: {len(target.atoms)}"
-        )
-
-        for i, ref_atom in enumerate(reference.atoms):
-            ref_name = ref_atom["atom_name"]
-            logger.debug(
-                f"Looking for match for {ref_name}({ref_atom['residue_name']})"
-            )
-
-            for j, target_atom in enumerate(target.atoms):
-                if j in used_target_indices:
-                    continue
-
-                target_name = target_atom["atom_name"]
-                if ref_name == target_name:
-                    matched_pairs.append((i, j))
-                    used_target_indices.add(j)
-                    logger.debug(
-                        f"Matched {ref_name}({ref_atom['residue_name']}) -> "
-                        f"{target_name}({target_atom['residue_name']})"
-                    )
-                    break
-
-        logger.debug(f"Found {len(matched_pairs)} atom matches")
-
-        if not matched_pairs:
+        # If alignment failed, return empty result
+        if not result.matched_pairs:
             return AlignmentResult(
                 rmsd=float("inf"),
                 matched_atoms=0,
@@ -79,25 +47,7 @@ class AlignmentService:
                 matched_pairs=[],
             )
 
-        # Extract matched coordinates
-        ref_matched = np.array([ref_coords[i] for i, _ in matched_pairs])
-        target_matched = np.array([target_coords[j] for _, j in matched_pairs])
-
-        # Calculate optimal transformation
-        rotation, translation = self._calculate_transformation(
-            ref_matched, target_matched
-        )
-
-        # Apply transformation and calculate RMSD
-        aligned_coords = np.dot(target_matched, rotation.T) + translation
-        rmsd = np.sqrt(np.mean(np.sum((ref_matched - aligned_coords) ** 2, axis=1)))
-
-        return AlignmentResult(
-            rmsd=rmsd,
-            matched_atoms=len(matched_pairs),
-            transformation_matrix=(rotation, translation),
-            matched_pairs=matched_pairs,
-        )
+        return result
 
     def _calculate_transformation(
         self, coords1: np.ndarray, coords2: np.ndarray
@@ -147,18 +97,15 @@ class AlignmentService:
 
         # Find close contacts
         clash_pairs = []
-        min_distance = float("inf")
 
         for i, coord1 in enumerate(ref_coords):
             for j, coord2 in enumerate(aligned_coords):
                 dist = np.linalg.norm(coord1 - coord2)
                 if dist < cutoff:
                     clash_pairs.append((i, j))
-                    min_distance = min(min_distance, dist)
 
         return ClashResult(
             has_clashes=len(clash_pairs) > 0,
             num_clashes=len(clash_pairs),
             clash_pairs=clash_pairs,
-            min_distance=min_distance if clash_pairs else float("inf"),
         )

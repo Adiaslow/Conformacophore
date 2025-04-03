@@ -222,9 +222,8 @@ class GromacsPDBConverter:
 
             # Parse gmx check output
             for line in result.stdout.split("\n") + result.stderr.split("\n"):
-                if "Number of frames" in line:
+                if "Coords" in line:
                     info["n_frames"] = int(line.split()[-1])
-                elif "Number of atoms" in line:
                     info["n_atoms"] = int(line.split()[-1])
                 elif "Last frame time" in line:
                     info["time_range"] = (0, float(line.split()[-1]))
@@ -548,6 +547,25 @@ class GromacsPDBConverter:
                 self.logger.info(f"Copying result to {output_pdb}...")
 
             self._copy_file_chunked(local_pdb, output_pdb)
+
+            # Count actual frames in output PDB
+            frame_count = 0
+            with open(output_pdb, "r") as f:
+                for line in f:
+                    if line.startswith("MODEL"):
+                        frame_count += 1
+
+            # Update conversion summary with actual frame count
+            summary_file = output_dir_path / "conversion_summary.json"
+            if summary_file.exists():
+                with open(summary_file, "r") as f:
+                    summary = json.load(f)
+                summary["n_frames"] = frame_count
+                summary["n_atoms"] = len(
+                    residue_sequence
+                )  # Use number of residues as atom count
+                with open(summary_file, "w") as f:
+                    json.dump(summary, f, indent=2)
 
             # Verify CONECT records were written
             if self.verbose:
