@@ -1,0 +1,219 @@
+TITLE     Frame 1000 from 300K_fit_4000.xtc
+REMARK    EXTRACTED FROM TRAJECTORY USING TEMPLATE-BASED APPROACH
+ATOM      1  N   PRP X   1     228.100 242.500 193.100  1.00  0.00           N
+ATOM      2  CB  PRP X   1     219.300 247.000 181.900  1.00  0.00           C
+ATOM      3 HB2  PRP X   1     222.300 256.100 176.800  1.00  0.00           H
+ATOM      4 HB3  PRP X   1     220.400 239.900 173.600  1.00  0.00           H
+ATOM      5  CG  PRP X   1     204.200 248.000 186.400  1.00  0.00           C
+ATOM      6 HG2  PRP X   1     200.100 238.000 187.800  1.00  0.00           H
+ATOM      7 HG3  PRP X   1     204.100 253.700 195.700  1.00  0.00           H
+ATOM      8  CD  PRP X   1     195.900 254.600 176.000  1.00  0.00           C
+ATOM      9 HD1  PRP X   1     198.500 264.800 172.900  1.00  0.00           H
+ATOM     10 HD2  PRP X   1     185.400 255.200 178.600  1.00  0.00           H
+ATOM     11 HD3  PRP X   1     196.300 249.300 166.400  1.00  0.00           H
+ATOM     12  CA  PRP X   1     238.300 252.200 197.300  1.00  0.00           C
+ATOM     13 HA2  PRP X   1     235.600 262.300 194.600  1.00  0.00           H
+ATOM     14 HA3  PRP X   1     240.400 251.500 208.000  1.00  0.00           H
+ATOM     15  C   PRP X   1     251.700 249.100 191.900  1.00  0.00           C
+ATOM     16  O   PRP X   1     261.500 254.900 197.000  1.00  0.00           O
+ATOM     17  N   DLE X   2     252.700 241.300 181.500  1.00  0.00           N
+ATOM     18  H   DLE X   2     243.600 237.300 179.700  1.00  0.00           H
+ATOM     19  CA  DLE X   2     264.100 237.600 172.600  1.00  0.00           C
+ATOM     20  HA  DLE X   2     270.700 246.400 172.000  1.00  0.00           H
+ATOM     21  CB  DLE X   2     258.700 234.400 158.300  1.00  0.00           C
+ATOM     22 HB2  DLE X   2     267.700 231.100 153.200  1.00  0.00           H
+ATOM     23 HB3  DLE X   2     252.300 225.700 159.100  1.00  0.00           H
+ATOM     24  CG  DLE X   2     251.100 245.300 150.900  1.00  0.00           C
+ATOM     25  HG  DLE X   2     243.100 250.100 156.600  1.00  0.00           H
+ATOM     26 CD1  DLE X   2     245.100 238.000 138.500  1.00  0.00           C
+ATOM     27 HD11 DLE X   2     243.400 244.400 129.900  1.00  0.00           H
+ATOM     28 HD12 DLE X   2     234.900 234.800 141.000  1.00  0.00           H
+ATOM     29 HD13 DLE X   2     251.700 230.000 135.100  1.00  0.00           H
+ATOM     30 CD2  DLE X   2     260.600 256.400 145.900  1.00  0.00           C
+ATOM     31 HD21 DLE X   2     266.500 252.200 137.600  1.00  0.00           H
+ATOM     32 HD22 DLE X   2     268.300 259.700 152.900  1.00  0.00           H
+ATOM     33 HD23 DLE X   2     254.100 264.000 141.600  1.00  0.00           H
+ATOM     34  C   DLE X   2     271.900 226.400 178.500  1.00  0.00           C
+ATOM     35  O   DLE X   2     267.000 219.000 186.800  1.00  0.00           O
+ATOM     36  N   DLE X   3     283.700 223.700 172.200  1.00  0.00           N
+ATOM     37  H   DLE X   3     284.800 228.000 163.100  1.00  0.00           H
+ATOM     38  CA  DLE X   3     293.500 213.900 176.500  1.00  0.00           C
+ATOM     39  HA  DLE X   3     296.900 215.900 186.800  1.00  0.00           H
+ATOM     40  CB  DLE X   3     306.000 214.200 167.100  1.00  0.00           C
+ATOM     41 HB2  DLE X   3     312.800 206.200 169.600  1.00  0.00           H
+ATOM     42 HB3  DLE X   3     301.800 211.500 157.200  1.00  0.00           H
+ATOM     43  CG  DLE X   3     313.800 227.400 166.400  1.00  0.00           C
+ATOM     44  HG  DLE X   3     306.600 235.500 164.400  1.00  0.00           H
+ATOM     45 CD1  DLE X   3     320.800 231.700 179.700  1.00  0.00           C
+ATOM     46 HD11 DLE X   3     329.400 225.100 180.600  1.00  0.00           H
+ATOM     47 HD12 DLE X   3     313.700 231.300 188.000  1.00  0.00           H
+ATOM     48 HD13 DLE X   3     324.500 241.800 179.100  1.00  0.00           H
+ATOM     49 CD2  DLE X   3     323.900 227.400 155.000  1.00  0.00           C
+ATOM     50 HD21 DLE X   3     332.700 221.500 157.200  1.00  0.00           H
+ATOM     51 HD22 DLE X   3     326.600 237.700 152.200  1.00  0.00           H
+ATOM     52 HD23 DLE X   3     320.000 222.900 145.900  1.00  0.00           H
+ATOM     53  C   DLE X   3     287.500 199.800 177.800  1.00  0.00           C
+ATOM     54  O   DLE X   3     289.300 193.800 188.000  1.00  0.00           O
+ATOM     55  N   DPR X   4     280.500 193.400 167.900  1.00  0.00           N
+ATOM     56  CD  DPR X   4     276.600 198.000 154.700  1.00  0.00           C
+ATOM     57 HD2  DPR X   4     269.800 206.300 155.900  1.00  0.00           H
+ATOM     58 HD3  DPR X   4     285.200 200.100 148.400  1.00  0.00           H
+ATOM     59  CG  DPR X   4     269.300 185.700 148.100  1.00  0.00           C
+ATOM     60 HG2  DPR X   4     258.600 185.600 150.300  1.00  0.00           H
+ATOM     61 HG3  DPR X   4     270.600 185.200 137.400  1.00  0.00           H
+ATOM     62  CB  DPR X   4     275.800 174.300 156.100  1.00  0.00           C
+ATOM     63 HB2  DPR X   4     286.400 173.200 153.400  1.00  0.00           H
+ATOM     64 HB3  DPR X   4     269.300 165.600 155.200  1.00  0.00           H
+ATOM     65  CA  DPR X   4     275.700 179.800 169.800  1.00  0.00           C
+ATOM     66  HA  DPR X   4     283.400 173.300 174.100  1.00  0.00           H
+ATOM     67  C   DPR X   4     261.900 178.500 176.600  1.00  0.00           C
+ATOM     68  O   DPR X   4     258.100 167.400 179.500  1.00  0.00           O
+ATOM     69  N   DLE X   5     254.700 189.400 178.900  1.00  0.00           N
+ATOM     70  H   DLE X   5     258.300 198.400 175.900  1.00  0.00           H
+ATOM     71  CA  DLE X   5     240.200 189.000 183.400  1.00  0.00           C
+ATOM     72  HA  DLE X   5     238.900 183.200 192.500  1.00  0.00           H
+ATOM     73  CB  DLE X   5     230.700 182.600 172.800  1.00  0.00           C
+ATOM     74 HB2  DLE X   5     230.200 188.800 163.800  1.00  0.00           H
+ATOM     75 HB3  DLE X   5     234.400 173.000 169.500  1.00  0.00           H
+ATOM     76  CG  DLE X   5     215.900 179.000 177.100  1.00  0.00           C
+ATOM     77  HG  DLE X   5     212.500 188.700 180.900  1.00  0.00           H
+ATOM     78 CD1  DLE X   5     208.400 175.700 164.700  1.00  0.00           C
+ATOM     79 HD11 DLE X   5     209.500 184.000 157.500  1.00  0.00           H
+ATOM     80 HD12 DLE X   5     197.800 174.400 166.600  1.00  0.00           H
+ATOM     81 HD13 DLE X   5     212.000 167.300 158.800  1.00  0.00           H
+ATOM     82 CD2  DLE X   5     214.300 168.700 188.100  1.00  0.00           C
+ATOM     83 HD21 DLE X   5     221.000 171.400 196.200  1.00  0.00           H
+ATOM     84 HD22 DLE X   5     218.000 158.900 184.900  1.00  0.00           H
+ATOM     85 HD23 DLE X   5     204.200 168.800 191.800  1.00  0.00           H
+ATOM     86  C   DLE X   5     235.700 203.700 186.100  1.00  0.00           C
+ATOM     87  O   DLE X   5     238.800 212.900 178.700  1.00  0.00           O
+ATOM     88  N   PHE X   6     227.100 206.300 195.500  1.00  0.00           N
+ATOM     89  H   PHE X   6     223.800 199.100 201.800  1.00  0.00           H
+ATOM     90  CA  PHE X   6     219.300 218.900 195.400  1.00  0.00           C
+ATOM     91  HA  PHE X   6     215.900 220.100 185.000  1.00  0.00           H
+ATOM     92  CB  PHE X   6     207.500 216.900 204.300  1.00  0.00           C
+ATOM     93 HB2  PHE X   6     211.200 215.100 214.300  1.00  0.00           H
+ATOM     94 HB3  PHE X   6     202.300 226.500 204.500  1.00  0.00           H
+ATOM     95  CG  PHE X   6     197.700 206.300 199.700  1.00  0.00           C
+ATOM     96 CD1  PHE X   6     195.500 195.600 208.000  1.00  0.00           C
+ATOM     97 HD1  PHE X   6     201.500 194.700 217.000  1.00  0.00           H
+ATOM     98 CE1  PHE X   6     186.000 185.900 204.600  1.00  0.00           C
+ATOM     99 HE1  PHE X   6     183.700 177.400 211.000  1.00  0.00           H
+ATOM    100  CZ  PHE X   6     180.300 186.600 191.900  1.00  0.00           C
+ATOM    101  HZ  PHE X   6     174.200 178.100 189.000  1.00  0.00           H
+ATOM    102 CE2  PHE X   6     182.200 197.500 183.100  1.00  0.00           C
+ATOM    103 HE2  PHE X   6     177.000 198.400 173.700  1.00  0.00           H
+ATOM    104 CD2  PHE X   6     190.700 207.800 187.400  1.00  0.00           C
+ATOM    105 HD2  PHE X   6     192.700 216.600 181.200  1.00  0.00           H
+ATOM    106  C   PHE X   6     228.400 230.700 200.200  1.00  0.00           C
+ATOM    107  O   PHE X   6     233.700 229.000 211.400  1.00  0.00           O
+CONECT   15   16
+CONECT   15   17
+CONECT   12   15
+CONECT    5    8
+CONECT    2    5
+CONECT    1    2
+CONECT    1   12
+CONECT    1  106
+CONECT   19   17
+CONECT   21   19
+CONECT   24   21
+CONECT   26   24
+CONECT   30   24
+CONECT   34   19
+CONECT   34   36
+CONECT   35   34
+CONECT   38   36
+CONECT   40   38
+CONECT   43   40
+CONECT   45   43
+CONECT   49   43
+CONECT   53   38
+CONECT   53   55
+CONECT   54   53
+CONECT   56   55
+CONECT   59   56
+CONECT   62   59
+CONECT   65   55
+CONECT   65   62
+CONECT   67   65
+CONECT   67   69
+CONECT   68   67
+CONECT   71   69
+CONECT   73   71
+CONECT   76   73
+CONECT   78   76
+CONECT   82   76
+CONECT   86   71
+CONECT   86   88
+CONECT   87   86
+CONECT  106  107
+CONECT  102  104
+CONECT  100  102
+CONECT   98  100
+CONECT   96   98
+CONECT   95   96
+CONECT   95  104
+CONECT   92   95
+CONECT   90   92
+CONECT   90  106
+CONECT   88   90
+CONECT   12   13
+CONECT   12   14
+CONECT    8    9
+CONECT    8   10
+CONECT    8   11
+CONECT    5    6
+CONECT    5    7
+CONECT    2    3
+CONECT    2    4
+CONECT   18   17
+CONECT   20   19
+CONECT   22   21
+CONECT   23   21
+CONECT   25   24
+CONECT   27   26
+CONECT   28   26
+CONECT   29   26
+CONECT   31   30
+CONECT   32   30
+CONECT   33   30
+CONECT   37   36
+CONECT   39   38
+CONECT   41   40
+CONECT   42   40
+CONECT   44   43
+CONECT   46   45
+CONECT   47   45
+CONECT   48   45
+CONECT   50   49
+CONECT   51   49
+CONECT   52   49
+CONECT   57   56
+CONECT   58   56
+CONECT   60   59
+CONECT   61   59
+CONECT   63   62
+CONECT   64   62
+CONECT   66   65
+CONECT   70   69
+CONECT   72   71
+CONECT   74   73
+CONECT   75   73
+CONECT   77   76
+CONECT   79   78
+CONECT   80   78
+CONECT   81   78
+CONECT   83   82
+CONECT   84   82
+CONECT   85   82
+CONECT  104  105
+CONECT  102  103
+CONECT  100  101
+CONECT   98   99
+CONECT   96   97
+CONECT   92   93
+CONECT   92   94
+CONECT   90   91
+CONECT   88   89
+END

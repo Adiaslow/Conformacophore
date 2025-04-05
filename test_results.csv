@@ -1,0 +1,5 @@
+frame,rmsd,matched_atoms,has_clashes,num_clashes,success,output,error
+frame_0.pdb,3.632559910795017e-15,33,False,0,True,test_aligned/aligned_frame_0.pdb,
+frame_100.pdb,2.33251192026669,33,False,0,True,test_aligned/aligned_frame_100.pdb,
+frame_1000.pdb,37.57521919456656,33,False,0,True,test_aligned/aligned_frame_1000.pdb,
+frame_20.pdb,3.4588365578987466,33,False,0,True,test_aligned/aligned_frame_20.pdb,

@@ -1117,7 +1117,6 @@ def main():
         # Delete any existing lock files in /tmp
         try:
             import glob
-            import os
 
             for lock_file in glob.glob("/tmp/MDA_*.lock"):
                 try:

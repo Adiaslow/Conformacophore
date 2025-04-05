@@ -1,0 +1,3 @@
+frame,rmsd,matched_atoms,has_clashes,num_clashes,success
+frame_1.pdb,,0,False,0,False
+frame_2.pdb,,0,False,0,False
