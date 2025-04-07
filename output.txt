@@ -1,0 +1,101 @@
+Found 1000 frame files
+Processing 5 frames
+
+Processing frame 1/5: /Volumes/LokeyLabShared/Adam/chads_library_conf/Hex/CHCl3/x_177/pdb_frames/frame_0.pdb
+Running: python3 src/scripts/simple_match.py /Volumes/LokeyLabShared/Adam/chads_library_conf/Hex/CHCl3/x_177/pdb_frames/frame_0.pdb /Volumes/LokeyLabShared/Adam/chads_library_conf/ref/vhl1.pdb --metrics-file /Volumes/LokeyLabShared/Adam/chads_library_conf/Hex/CHCl3/x_177/pdb_frames/superimposition_metrics.json --output-dir /Volumes/LokeyLabShared/Adam/chads_library_conf/Hex/CHCl3/x_177/superimposed --verbose --clash-cutoff 1.5
+Saving superimposed structure for frame_0 to /Volumes/LokeyLabShared/Adam/chads_library_conf/Hex/CHCl3/x_177/superimposed/superimposed_frame_0.pdb
+Found 83 CONECT records in reference structure
+Found 83 CONECT records in test structure
+Found transformation data in metrics file for frame 0
+RMSD from metrics: 14.1932
+Test molecule: 107 atoms
+Protein: 2671 atoms
+Clash detection with cutoff 1.5 Å:
+  Has clashes: True
+  Number of clashing atoms: 11
+Successfully saved superimposed structure to /Volumes/LokeyLabShared/Adam/chads_library_conf/Hex/CHCl3/x_177/superimposed/superimposed_frame_0.pdb
+
+Successfully processed frame 1
+
+Processing frame 2/5: /Volumes/LokeyLabShared/Adam/chads_library_conf/Hex/CHCl3/x_177/pdb_frames/frame_100.pdb
+Running: python3 src/scripts/simple_match.py /Volumes/LokeyLabShared/Adam/chads_library_conf/Hex/CHCl3/x_177/pdb_frames/frame_100.pdb /Volumes/LokeyLabShared/Adam/chads_library_conf/ref/vhl1.pdb --metrics-file /Volumes/LokeyLabShared/Adam/chads_library_conf/Hex/CHCl3/x_177/pdb_frames/superimposition_metrics.json --output-dir /Volumes/LokeyLabShared/Adam/chads_library_conf/Hex/CHCl3/x_177/superimposed --verbose --clash-cutoff 1.5
+Saving superimposed structure for frame_100 to /Volumes/LokeyLabShared/Adam/chads_library_conf/Hex/CHCl3/x_177/superimposed/superimposed_frame_100.pdb
+Found 83 CONECT records in reference structure
+Found 83 CONECT records in test structure
+Found transformation data in metrics file for frame 100
+RMSD from metrics: 13.0472
+Test molecule: 107 atoms
+Protein: 2671 atoms
+Clash detection with cutoff 1.5 Å:
+  Has clashes: True
+  Number of clashing atoms: 4
+Successfully saved superimposed structure to /Volumes/LokeyLabShared/Adam/chads_library_conf/Hex/CHCl3/x_177/superimposed/superimposed_frame_100.pdb
+
+Successfully processed frame 2
+
+Processing frame 3/5: /Volumes/LokeyLabShared/Adam/chads_library_conf/Hex/CHCl3/x_177/pdb_frames/frame_1000.pdb
+Running: python3 src/scripts/simple_match.py /Volumes/LokeyLabShared/Adam/chads_library_conf/Hex/CHCl3/x_177/pdb_frames/frame_1000.pdb /Volumes/LokeyLabShared/Adam/chads_library_conf/ref/vhl1.pdb --metrics-file /Volumes/LokeyLabShared/Adam/chads_library_conf/Hex/CHCl3/x_177/pdb_frames/superimposition_metrics.json --output-dir /Volumes/LokeyLabShared/Adam/chads_library_conf/Hex/CHCl3/x_177/superimposed --verbose --clash-cutoff 1.5
+Saving superimposed structure for frame_1000 to /Volumes/LokeyLabShared/Adam/chads_library_conf/Hex/CHCl3/x_177/superimposed/superimposed_frame_1000.pdb
+Found 83 CONECT records in reference structure
+Found 83 CONECT records in test structure
+Found transformation data in metrics file for frame 1000
+RMSD from metrics: 6.7148
+Test molecule: 107 atoms
+Protein: 2671 atoms
+Clash detection with cutoff 1.5 Å:
+  Has clashes: True
+  Number of clashing atoms: 5
+Successfully saved superimposed structure to /Volumes/LokeyLabShared/Adam/chads_library_conf/Hex/CHCl3/x_177/superimposed/superimposed_frame_1000.pdb
+
+Successfully processed frame 3
+
+Processing frame 4/5: /Volumes/LokeyLabShared/Adam/chads_library_conf/Hex/CHCl3/x_177/pdb_frames/frame_1004.pdb
+Running: python3 src/scripts/simple_match.py /Volumes/LokeyLabShared/Adam/chads_library_conf/Hex/CHCl3/x_177/pdb_frames/frame_1004.pdb /Volumes/LokeyLabShared/Adam/chads_library_conf/ref/vhl1.pdb --metrics-file /Volumes/LokeyLabShared/Adam/chads_library_conf/Hex/CHCl3/x_177/pdb_frames/superimposition_metrics.json --output-dir /Volumes/LokeyLabShared/Adam/chads_library_conf/Hex/CHCl3/x_177/superimposed --verbose --clash-cutoff 1.5
+Saving superimposed structure for frame_1004 to /Volumes/LokeyLabShared/Adam/chads_library_conf/Hex/CHCl3/x_177/superimposed/superimposed_frame_1004.pdb
+Found 83 CONECT records in reference structure
+Found 83 CONECT records in test structure
+Found transformation data in metrics file for frame 1004
+RMSD from metrics: 8.7589
+Test molecule: 107 atoms
+Protein: 2671 atoms
+Clash detection with cutoff 1.5 Å:
+  Has clashes: True
+  Number of clashing atoms: 6
+Successfully saved superimposed structure to /Volumes/LokeyLabShared/Adam/chads_library_conf/Hex/CHCl3/x_177/superimposed/superimposed_frame_1004.pdb
+
+Successfully processed frame 4
+
+Processing frame 5/5: /Volumes/LokeyLabShared/Adam/chads_library_conf/Hex/CHCl3/x_177/pdb_frames/frame_1008.pdb
+Running: python3 src/scripts/simple_match.py /Volumes/LokeyLabShared/Adam/chads_library_conf/Hex/CHCl3/x_177/pdb_frames/frame_1008.pdb /Volumes/LokeyLabShared/Adam/chads_library_conf/ref/vhl1.pdb --metrics-file /Volumes/LokeyLabShared/Adam/chads_library_conf/Hex/CHCl3/x_177/pdb_frames/superimposition_metrics.json --output-dir /Volumes/LokeyLabShared/Adam/chads_library_conf/Hex/CHCl3/x_177/superimposed --verbose --clash-cutoff 1.5
+Saving superimposed structure for frame_1008 to /Volumes/LokeyLabShared/Adam/chads_library_conf/Hex/CHCl3/x_177/superimposed/superimposed_frame_1008.pdb
+Found 83 CONECT records in reference structure
+Found 83 CONECT records in test structure
+Found transformation data in metrics file for frame 1008
+RMSD from metrics: 7.3418
+Test molecule: 107 atoms
+Protein: 2671 atoms
+Clash detection with cutoff 1.5 Å:
+  Has clashes: True
+  Number of clashing atoms: 3
+Successfully saved superimposed structure to /Volumes/LokeyLabShared/Adam/chads_library_conf/Hex/CHCl3/x_177/superimposed/superimposed_frame_1008.pdb
+
+Successfully processed frame 5
+
+Created 5 superimposed structure files:
+  /Volumes/LokeyLabShared/Adam/chads_library_conf/Hex/CHCl3/x_177/superimposed/superimposed_frame_0.pdb
+  /Volumes/LokeyLabShared/Adam/chads_library_conf/Hex/CHCl3/x_177/superimposed/superimposed_frame_100.pdb
+  /Volumes/LokeyLabShared/Adam/chads_library_conf/Hex/CHCl3/x_177/superimposed/superimposed_frame_1000.pdb
+  /Volumes/LokeyLabShared/Adam/chads_library_conf/Hex/CHCl3/x_177/superimposed/superimposed_frame_1004.pdb
+  /Volumes/LokeyLabShared/Adam/chads_library_conf/Hex/CHCl3/x_177/superimposed/superimposed_frame_1008.pdb
+
+To visualize these PDB files:
+1. Open them in PyMOL, ChimeraX, or similar
+2. Chain A, B, C: Protein target
+3. Chain D: Reference ligand
+4. Chain E: Superimposed test molecule
+
+You should see the test molecule (E) properly superimposed onto the reference ligand (D)
+This implementation uses the transformation matrices from your metrics file
+rather than recalculating the superimposition.
+
+Clash detection is now using a cutoff of 1.5 Angstroms (reduced from default 2.0)

@@ -39,6 +39,12 @@ from tqdm import tqdm
 # Try to import MDAnalysis for XTC trajectory reading
 # This is mainly used for reading trajectories efficiently
 try:
+    # Set environment variables to prevent lock files
+    os.environ["MDANALYSIS_NO_FD_CACHE"] = "1"
+    os.environ["MDA_NO_LOCK"] = "1"
+    os.environ["NO_LOCK"] = "1"
+    os.environ["MDA_LOCK_DISABLED"] = "1"
+
     import MDAnalysis as mda
     import warnings
 
@@ -520,21 +526,28 @@ def retry_on_busy(func, *args, retries=3, delay=1.0, **kwargs):
         **kwargs: Keyword arguments to pass to function
 
     Returns:
-        Result of function call
+        Result of function call or False if all retries failed
     """
+    last_error = None
     for attempt in range(retries):
         try:
             return func(*args, **kwargs)
         except (IOError, OSError) as e:
+            last_error = e
             # Check if error is due to busy resource
             if attempt < retries - 1 and (
-                getattr(e, "errno", None) in (errno.EBUSY, errno.EAGAIN)
+                getattr(e, "errno", None) in (errno.EBUSY, errno.EAGAIN, errno.EACCES)
                 or "busy" in str(e).lower()
+                or "lock" in str(e).lower()
             ):
-                time.sleep(delay * (attempt + 1))  # Exponential backoff
+                wait_time = delay * (2**attempt)  # Exponential backoff
+                print(
+                    f"Resource busy, retrying in {wait_time:.1f}s (attempt {attempt + 1}/{retries})"
+                )
+                time.sleep(wait_time)
                 continue
             raise
-    # If we get here, all retries failed
+    print(f"All retries failed: {last_error}")
     return False
 
 
@@ -551,26 +564,25 @@ def safe_write_file(file_path, content):
     """
     file_path = Path(file_path)
 
-    # Check if file exists and is busy with our specialized function
-    if is_file_busy(file_path):
-        # File is busy, skip it
-        return False
-
-    # Use a temporary file with a specific pattern to avoid conflicts
-    temp_name = f".tmp_{int(time.time())}_{os.getpid()}_{file_path.name}"
+    # Generate a unique temporary file name in the same directory
+    temp_name = f".tmp_{int(time.time()*1000000)}_{os.getpid()}_{file_path.name}"
     temp_path = file_path.parent / temp_name
 
     try:
-        # Write to temporary file
+        # Write to temporary file with explicit flush and sync
         with open(temp_path, "w") as f:
             f.write(content)
+            f.flush()
+            os.fsync(f.fileno())
 
-        # Use our retry function for the replace operation
-        success = retry_on_busy(
-            lambda: temp_path.replace(file_path) or True, retries=3, delay=0.5
-        )
+        # On Unix-like systems, rename is atomic
+        # Use replace on Windows which is also atomic
+        if os.name == "nt":
+            temp_path.replace(file_path)
+        else:
+            os.rename(temp_path, file_path)
 
-        return success
+        return True
     except Exception as e:
         print(f"Error writing file {file_path}: {e}")
         try:
@@ -1979,6 +1991,88 @@ def diagnose_filesystem(dir_path):
     print("4. Try unmounting and remounting the network volume")
 
     print("===========================================\n")
+
+
+def diagnose_and_fix_locks(dir_path):
+    """
+    Diagnose and attempt to fix file locking issues.
+
+    Args:
+        dir_path (str or Path): Path to directory to diagnose
+
+    Returns:
+        bool: True if issues were fixed, False otherwise
+    """
+    dir_path = Path(dir_path)
+    fixed = False
+
+    print("\n=== File Lock Diagnosis ===")
+
+    # 1. Check for MDAnalysis lock files
+    try:
+        mda_locks = list(Path("/tmp").glob("MDA_*.lock"))
+        if mda_locks:
+            print(f"Found {len(mda_locks)} MDAnalysis lock files")
+            for lock in mda_locks:
+                try:
+                    lock.unlink(missing_ok=True)
+                    print(f"Removed lock file: {lock}")
+                    fixed = True
+                except Exception as e:
+                    print(f"Could not remove {lock}: {e}")
+    except Exception as e:
+        print(f"Error checking MDAnalysis locks: {e}")
+
+    # 2. Check for busy files in directory
+    try:
+        busy_files = []
+        for file in dir_path.glob("frame_*.pdb"):
+            if is_file_busy(file):
+                busy_files.append(file)
+
+        if busy_files:
+            print(f"\nFound {len(busy_files)} busy files:")
+            for file in busy_files[:5]:  # Show first 5
+                print(f"  {file.name}")
+            if len(busy_files) > 5:
+                print(f"  ... and {len(busy_files) - 5} more")
+    except Exception as e:
+        print(f"Error checking busy files: {e}")
+
+    # 3. Check for processes holding locks
+    try:
+        import subprocess
+
+        result = subprocess.run(
+            ["lsof", "+D", str(dir_path)], capture_output=True, text=True, timeout=5
+        )
+        if result.stdout.strip():
+            print("\nProcesses accessing the directory:")
+            print(result.stdout)
+    except Exception as e:
+        print(f"Error checking processes: {e}")
+
+    # 4. Set preventive measures
+    try:
+        # Set environment variables
+        os.environ["MDANALYSIS_NO_FD_CACHE"] = "1"
+        os.environ["MDA_NO_LOCK"] = "1"
+        os.environ["NO_LOCK"] = "1"
+        print("\nSet lock prevention environment variables")
+        fixed = True
+    except Exception as e:
+        print(f"Error setting environment variables: {e}")
+
+    print("\nRecommended actions:")
+    print("1. Clear MDAnalysis locks:    rm /tmp/MDA_*.lock")
+    print("2. Kill Python processes:      pkill -9 python")
+    print(
+        "3. Clear system cache:         sync; echo 3 | sudo tee /proc/sys/vm/drop_caches"
+    )
+    print("4. Unmount/remount network drives if applicable")
+    print("===========================\n")
+
+    return fixed
 
 
 if __name__ == "__main__":

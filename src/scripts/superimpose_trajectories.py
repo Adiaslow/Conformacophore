@@ -34,25 +34,62 @@ from typing import (
     Generator,
     TypeVar,
     cast,
+    defaultdict,
 )
 import numpy as np
-from concurrent.futures import ProcessPoolExecutor, as_completed
-from tqdm import tqdm
-import networkx as nx
-import functools
-from Bio.PDB.PDBParser import PDBParser
-from Bio.PDB.PDBIO import PDBIO, Select
-from Bio.PDB.Superimposer import Superimposer
-from Bio.PDB.Structure import Structure
-from Bio.PDB.Model import Model
-from Bio.PDB.Chain import Chain
-from Bio.PDB.Atom import Atom
-from Bio.PDB.Residue import Residue
-import rdkit
-from rdkit import Chem
-from rdkit.Chem import AllChem
-from rdkit.Chem.rdFMCS import FindMCS
 from numpy.typing import NDArray
+from concurrent.futures import ProcessPoolExecutor, as_completed
+import time
+import sys
+import functools
+import traceback
+import shutil
+
+# Required import
+import networkx as nx
+
+try:
+    from Bio.PDB.PDBParser import PDBParser
+    from Bio.PDB.PDBIO import PDBIO, Select
+    from Bio.PDB.Superimposer import Superimposer
+    from Bio.PDB.Structure import Structure
+    from Bio.PDB.Model import Model
+    from Bio.PDB.Chain import Chain
+    from Bio.PDB.Atom import Atom
+    from Bio.PDB.Residue import Residue
+    from Bio.PDB.Atom import DisorderedAtom
+
+    BIOPYTHON_AVAILABLE = True
+except ImportError:
+    BIOPYTHON_AVAILABLE = False
+    print(
+        "WARNING: BioPython not available. Please install it with: pip install biopython"
+    )
+
+    print(
+        "WARNING: BioPython not available. Please install it with: pip install biopython"
+    )
+
+# Add RDKit import with fallback
+try:
+    import rdkit
+    from rdkit import Chem
+    from rdkit.Chem import AllChem
+
+    RDKIT_AVAILABLE = True
+except ImportError:
+    RDKIT_AVAILABLE = False
+    print("WARNING: RDKit not available. Some advanced features will be disabled.")
+
+    # Define placeholder for type annotations
+    class rdkit:
+        class Chem:
+            class Mol:
+                pass
+
+    class Chem:
+        pass
+
 
 # Global cache for reference data
 _REFERENCE_DATA: Dict[str, Any] = {
@@ -146,6 +183,7 @@ class MolecularGraph:
         structure: Optional[Structure] = None,
         chain_id: Optional[str] = None,
         is_reference: bool = False,
+        require_conect: bool = False,  # Make CONECT records optional by default
     ):
         """Initialize molecular graph from list of atoms.
 
@@ -157,6 +195,7 @@ class MolecularGraph:
             structure: Original structure for reference
             chain_id: Chain ID to filter CONECT records
             is_reference: Whether this is the reference ligand (True) or test compound (False)
+            require_conect: Whether to require CONECT records (default: False)
         """
         self.atoms = atoms
         self.name = name
@@ -166,6 +205,7 @@ class MolecularGraph:
         self.chain_id = chain_id
         self.is_reference = is_reference
         self.serial_to_atom = {}
+        self.require_conect = require_conect
         self.graph = self._create_graph()
 
     def get_coordinates(self) -> np.ndarray:
@@ -186,136 +226,83 @@ class MolecularGraph:
         serial_numbers: List[int] = []  # Track all serials for debugging
 
         for atom in self.atoms:
-            serial_to_atom[atom.serial_number] = atom
-            serial_numbers.append(atom.serial_number)
+            # Get atom serial number
+            serial = getattr(atom, "serial_number", None)
 
-            # Map by name (format: "N1", "C1", etc.)
-            name_to_atom[atom.name.strip()] = atom
+            # Some parsers use different attributes
+            if serial is None:
+                serial = getattr(atom, "serial", None)
 
-            # The atom may have a property with its original serial number
-            if hasattr(atom, "original_serial"):
-                original_serial = getattr(atom, "original_serial")
-                serial_to_atom[original_serial] = atom
-                serial_numbers.append(original_serial)
-                if self.logger and self.logger.isEnabledFor(logging.DEBUG):
-                    self.logger.debug(
-                        f"Atom {atom.name} has original serial: {original_serial}"
-                    )
+            # Fallback to using an index
+            if serial is None:
+                if hasattr(atom, "get_serial_number"):
+                    serial = atom.get_serial_number()
+                else:
+                    serial = len(serial_numbers) + 1
 
-        # Store for use in other methods
+            # Track serial numbers for debugging
+            serial_numbers.append(serial)
+
+            # Store atom in maps
+            serial_to_atom[serial] = atom
+            name_to_atom[atom.name] = atom
+
+            # Store atom data in graph node
+            element = self._get_atom_element(atom)
+            residue = getattr(atom, "parent", None)
+            residue_name, residue_id = self._get_residue_info(residue)
+
+            # Add node to graph
+            G.add_node(
+                atom,
+                serial=serial,
+                element=element,
+                name=atom.name,
+                residue_name=residue_name,
+                residue_id=residue_id,
+            )
+
+        # Save serial to atom map for later use
         self.serial_to_atom = serial_to_atom
 
-        # Log the serial numbers we have
-        if self.logger:
-            self.logger.debug(
-                f"{self.name} Atom serial numbers: {sorted(serial_numbers)}"
-            )
-
-        # Add nodes with attributes
-        for i, atom in enumerate(self.atoms):
-            residue = atom.get_parent()
-            residue_name, residue_id = self._get_residue_info(residue)
-            element = self._get_atom_element(atom)
-
-            node_attrs: Dict[str, Any] = {
-                "name": atom.name.strip(),  # Strip whitespace
-                "element": element,
-                "coord": tuple(atom.coord),
-                "residue_name": residue_name,
-                "residue_id": residue_id,
-                "idx": i,  # Keep track of original index
-                "serial": atom.serial_number,  # Keep track of PDB serial number
-            }
-
-            # Store original serial number if available
-            if hasattr(atom, "original_serial"):
-                node_attrs["original_serial"] = getattr(atom, "original_serial")
-
-            G.add_node(atom, **node_attrs)
-
-            if self.logger and self.logger.isEnabledFor(logging.DEBUG):
-                serial_info = (
-                    f", original: {getattr(atom, 'original_serial')}"
-                    if hasattr(atom, "original_serial")
-                    else ""
-                )
-                self.logger.debug(
-                    f"{self.name} Node {i}: {atom.name} {element} {residue_name} {residue_id} (serial: {atom.serial_number}{serial_info})"
-                )
-
-        # Check if we have CONECT records
-        if not self.conect_dict:
-            error_msg = f"{self.name} ERROR: No CONECT records found for this structure. CONECT records are required."
-            if self.logger:
-                self.logger.error(error_msg)
-            raise ValueError(error_msg)
-
-        # Add edges using CONECT records - this is the only supported connectivity method
-        edge_count = self._add_conect_edges(G)
-
-        # Check if we have enough edges for connectivity
-        if edge_count < 1:
-            error_msg = (
-                f"{self.name} ERROR: Failed to create any edges from CONECT records."
-            )
-            if self.logger:
-                self.logger.error(error_msg)
-            raise ValueError(error_msg)
-
-        # Additional validation - ensure the graph is reasonably connected
-        # For test compounds, be more lenient with connectivity requirements
-        min_edges = len(self.atoms) - 1 if self.is_reference else len(self.atoms) - 3
-        if len(G.edges) < min_edges:
-            # Try to infer missing edges based on distance
-            self._infer_missing_edges(G)
-
-            # Check connectivity again
-            if len(G.edges) < min_edges:
-                error_msg = f"{self.name} ERROR: Graph is not fully connected after using CONECT records and distance-based inference. Got {len(G.edges)} edges but need at least {min_edges}."
+        # Add edges based on CONECT records
+        if self.conect_dict:
+            edges_from_conect = self._add_edges_from_conect(G)
+            if edges_from_conect == 0 and self.require_conect:
+                error_msg = f"{self.name} ERROR: No valid CONECT records found for this structure. CONECT records are required."
                 if self.logger:
                     self.logger.error(error_msg)
-                    # Log detailed connectivity information
-                    self._log_connectivity_info(G)
                 raise ValueError(error_msg)
-
-                                if self.logger:
-            self.logger.info(
-                f"{self.name} Graph: {len(G.nodes)} nodes, {len(G.edges)} edges"
-            )
-
-        # Print degree distribution
-        degrees = {}
-        for node in G.nodes():
-            degrees[node] = len(
-                list(G.neighbors(node))
-            )  # Use neighbors instead of degree
-        terminal_nodes = [n for n in G.nodes if degrees[n] == 1]
+            elif self.require_conect:
+                error_msg = f"{self.name} ERROR: No CONECT records found for this structure. CONECT records are required."
+                if self.logger:
+                    self.logger.error(error_msg)
+                raise ValueError(error_msg)
+            else:
+                # If no CONECT records and not required, infer edges based on distances
                 if self.logger:
                     self.logger.info(
-                f"{self.name} Degree distribution: {sorted(degrees.values())}"
-            )
-            self.logger.info(f"{self.name} Terminal nodes: {len(terminal_nodes)}")
+                        f"{self.name} No CONECT records found, inferring edges based on distances"
+                    )
+                self._infer_missing_edges(G)
 
-            # Print element distribution
-            elements = [cast(Dict[str, str], G.nodes[n])["element"] for n in G.nodes]
-            element_counts: Dict[str, int] = {}
-            for e in elements:
-                if e not in element_counts:
-                    element_counts[e] = 0
-                element_counts[e] += 1
-            self.logger.info(f"{self.name} Element distribution: {element_counts}")
+        # Debug connectivity issues
+        if self.logger and self.logger.isEnabledFor(logging.DEBUG):
+            self._log_connectivity_info(G)
 
-            # Visualize the graph connectivity for debugging
-            components = list(nx.connected_components(G))
+        if len(G.edges()) == 0:
+            if self.logger:
+                self.logger.warning(
+                    f"{self.name} No edges found from CONECT records, inferring edges based on distances"
+                )
+            self._infer_missing_edges(G)
+
+        # Visualize the graph connectivity for debugging
+        components = list(nx.connected_components(G))
+        if self.logger:
             self.logger.info(f"{self.name} Connected components: {len(components)}")
             for i, comp in enumerate(components):
                 self.logger.info(f"{self.name} Component {i+1}: {len(comp)} nodes")
-                # Print a few atoms in each component
-                if len(comp) > 0:
-                    sample = list(comp)[:3]  # First 3 atoms
-                        self.logger.info(
-                        f"  Sample atoms: {[cast(Dict[str, str], G.nodes[n])['name'] for n in sample]}"
-                    )
 
         return G
 
@@ -362,15 +349,15 @@ class MolecularGraph:
 
                 # Add edge if atoms are close enough
                 if dist <= max_length:
-                                        G.add_edge(atom1, atom2)
+                    G.add_edge(atom1, atom2)
                     edges_added += 1
-                                        if self.logger:
-                                            self.logger.debug(
+                    if self.logger:
+                        self.logger.debug(
                             f"{self.name} Added inferred edge: {atom1.name}-{atom2.name} ({dist:.2f}Å)"
-                                            )
+                        )
 
             if self.logger:
-            self.logger.info(f"{self.name} Added {edges_added} inferred edges")
+                self.logger.info(f"{self.name} Added {edges_added} inferred edges")
 
     def _log_connectivity_info(self, G: nx.Graph) -> None:
         """Log detailed connectivity information for debugging.
@@ -410,41 +397,44 @@ class MolecularGraph:
                     f"{[f'{n.name}({n.serial_number})' for n in neighbors]}"
                 )
 
-    def _add_conect_edges(self, G: nx.Graph) -> int:
-        """Add edges based on CONECT records from PDB file.
+    def _add_edges_from_conect(self, G: nx.Graph) -> int:
+        """Add edges from CONECT records.
+
+        Args:
+            G: NetworkX graph to add edges to
 
         Returns:
             Number of edges added
         """
         if not self.conect_dict:
+            if self.require_conect:
+                error_msg = f"{self.name} ERROR: No CONECT dictionary provided. CONECT records are required."
+                if self.logger:
+                    self.logger.error(error_msg)
+                raise ValueError(error_msg)
             return 0
 
-        if self.logger:
-            self.logger.info(
-                f"{self.name} Using CONECT records from PDB for connectivity"
-            )
-
-            edge_count = 0
+        edge_count = 0
         missing_serials = []
         missing_connections = []
 
         # Direct mapping using CONECT records based on serial numbers
-            for serial, connected_serials in self.conect_dict.items():
+        for serial, connected_serials in self.conect_dict.items():
             # Serial number needs to be in our atom list
             if serial in self.serial_to_atom:
                 atom1 = self.serial_to_atom[serial]
-                    for connected_serial in connected_serials:
+                for connected_serial in connected_serials:
                     if connected_serial in self.serial_to_atom:
                         atom2 = self.serial_to_atom[connected_serial]
-                            # Only add each edge once (avoid duplicates)
-                            if atom1 != atom2 and not G.has_edge(atom1, atom2):
-                                G.add_edge(atom1, atom2)
-                                edge_count += 1
+                        # Only add each edge once (avoid duplicates)
+                        if atom1 != atom2 and not G.has_edge(atom1, atom2):
+                            G.add_edge(atom1, atom2)
+                            edge_count += 1
                         if self.logger and self.logger.isEnabledFor(logging.DEBUG):
-                                    self.logger.debug(
-                                        f"{self.name} Edge from CONECT: {atom1.name}({serial})-{atom2.name}({connected_serial})"
-                                    )
-        else:
+                            self.logger.debug(
+                                f"{self.name} Edge from CONECT: {atom1.name}({serial})-{atom2.name}({connected_serial})"
+                            )
+                    else:
                         missing_connections.append(connected_serial)
                         if self.logger and self.logger.isEnabledFor(logging.DEBUG):
                             self.logger.debug(
@@ -458,13 +448,19 @@ class MolecularGraph:
         # Log any issues with missing serials
         if missing_serials and self.logger:
             self.logger.warning(
-                f"{self.name} Could not find {len(missing_serials)} atom serials in the structure: {missing_serials[:10]}..."
+                f"{self.name} {len(missing_serials)} serials from CONECT records not found in atom list"
             )
 
         if missing_connections and self.logger:
             self.logger.warning(
-                f"{self.name} Could not find {len(missing_connections)} connected atom serials: {missing_connections[:10]}..."
-                                )
+                f"{self.name} {len(missing_connections)} connected serials from CONECT records not found in atom list"
+            )
+
+        if edge_count == 0 and self.require_conect:
+            error_msg = f"{self.name} ERROR: No valid CONECT records found for this structure. CONECT records are required."
+            if self.logger:
+                self.logger.error(error_msg)
+            raise ValueError(error_msg)
 
         if self.logger:
             self.logger.info(
@@ -837,34 +833,18 @@ def get_pdb_lines(pdb_file: str) -> List[str]:
     return lines
 
 
-def get_structure(pdb_file: str, structure_id: Optional[str] = None) -> Structure:
-    """Get a BioPython structure from a PDB file with caching.
+def get_structure(structure_id: str, pdb_file: str) -> Structure:
+    """Parse a PDB file and return the structure.
 
     Args:
+        structure_id: ID for the structure
         pdb_file: Path to the PDB file
-        structure_id: Identifier for the structure
 
     Returns:
         BioPython Structure object
     """
-    # Create a unique cache key from file path and structure ID
-    cache_key = f"{pdb_file}_{structure_id if structure_id else 'default'}"
-
-    # Check structure cache
-    if cache_key in _PDB_STRUCTURE_CACHE:
-        return _PDB_STRUCTURE_CACHE[cache_key]
-
-    # Parse the structure
-    if structure_id is None:
-        structure_id = Path(pdb_file).stem
-
-    structure = PDB_PARSER.get_structure(structure_id, pdb_file)
-    if not isinstance(structure, Structure):
-        raise ValueError(f"Failed to parse structure from {pdb_file}")
-
-    # Cache the result
-    _PDB_STRUCTURE_CACHE[cache_key] = structure
-    return structure
+    parser = PDBParser(QUIET=True)
+    return parser.get_structure(structure_id, pdb_file)
 
 
 def extract_chain_from_reference(
@@ -907,19 +887,20 @@ def extract_chain_from_reference(
 
 
 def parse_conect_records(
-    pdb_file: str, model_num: Optional[int] = None
+    pdb_file: str, model_num: Optional[int] = None, chain_id: Optional[str] = None
 ) -> Dict[int, List[int]]:
     """Parse CONECT records from a PDB file.
 
     Args:
         pdb_file: Path to PDB file
         model_num: Model number to extract (if None, get all)
+        chain_id: Chain ID to filter records for (if None, get all)
 
     Returns:
         Dictionary mapping atom serial numbers to lists of connected atom serial numbers
     """
-    # Create a cache key that includes the model number
-    cache_key = f"{pdb_file}_{model_num if model_num is not None else 'all'}"
+    # Create a cache key that includes the model number and chain ID
+    cache_key = f"{pdb_file}_{model_num if model_num is not None else 'all'}_{chain_id if chain_id is not None else 'all'}"
 
     # Check cache first
     if cache_key in _CONECT_CACHE:
@@ -928,14 +909,25 @@ def parse_conect_records(
     # Read the PDB file lines (using the cached version if available)
     lines = get_pdb_lines(pdb_file)
 
+    # First, if we're filtering by chain, get the atom serial numbers for that chain
+    chain_serials = set()
+    if chain_id is not None:
+        for line in lines:
+            if line.startswith(("ATOM ", "HETATM")):
+                if line[21:22].strip() == chain_id:  # Chain ID is in column 22
+                    try:
+                        serial = int(line[6:11].strip())
+                        chain_serials.add(serial)
+                    except ValueError:
+                        continue
+
     # Extract CONECT records
-        conect_dict = {}
+    conect_dict = {}
     model_found = model_num is None  # If model_num is None, process all lines
 
     for line in lines:
         if model_num is not None:
             if line.startswith("MODEL"):
-                # Check if this is the model we want
                 try:
                     current_model = int(line.split()[1])
                     model_found = current_model == model_num
@@ -948,13 +940,27 @@ def parse_conect_records(
                 continue
 
         if line.startswith("CONECT"):
-            parts = line.split()
-            if len(parts) > 2:  # At least one connection
-                atom_serial = int(parts[1])
-                connected_serials = [int(parts[i]) for i in range(2, len(parts))]
-                if atom_serial not in conect_dict:
-                    conect_dict[atom_serial] = []
-                conect_dict[atom_serial].extend(connected_serials)
+            try:
+                parts = line.split()
+                if len(parts) > 2:  # At least one connection
+                    atom_serial = int(parts[1])
+                    # Only include if this atom is in our chain
+                    if atom_serial in chain_serials:
+                        connected_serials = []
+                        for i in range(2, len(parts)):
+                            connected_serial = int(parts[i])
+                            # Only include connections to atoms in our chain
+                            if connected_serial in chain_serials:
+                                connected_serials.append(connected_serial)
+
+                        if (
+                            connected_serials
+                        ):  # Only add if there are connections to our chain
+                            if atom_serial not in conect_dict:
+                                conect_dict[atom_serial] = []
+                            conect_dict[atom_serial].extend(connected_serials)
+            except ValueError as e:
+                logger.warning(f"Skipping CONECT with invalid serial number: {line}")
 
     # Cache the result
     _CONECT_CACHE[cache_key] = conect_dict
@@ -975,8 +981,8 @@ def count_models_in_pdb(pdb_path: str) -> int:
 
     model_count = 0
     for line in lines:
-            if line.startswith("MODEL"):
-                model_count += 1
+        if line.startswith("MODEL"):
+            model_count += 1
 
     # If no MODEL records found, assume it's a single model
     return max(1, model_count)
@@ -1026,10 +1032,10 @@ def parse_pdb_for_ligand(
     # Now extract CONECT records and filter only those that connect our chain's atoms
     for line in lines:
         if line.startswith("CONECT"):
-                    parts = line.split()
-                    if len(parts) > 2:  # At least one connection
-                        try:
-                            atom_serial = int(parts[1])
+            try:
+                parts = line.split()
+                if len(parts) > 2:  # At least one connection
+                    atom_serial = int(parts[1])
                     # Only include if this atom is in our chain
                     if atom_serial in atom_serial_to_idx:
                         connected_serials = []
@@ -1045,10 +1051,8 @@ def parse_pdb_for_ligand(
                             if atom_serial not in conect_dict:
                                 conect_dict[atom_serial] = []
                             conect_dict[atom_serial].extend(connected_serials)
-                        except ValueError:
-                    logger.warning(
-                        f"Skipping CONECT with invalid serial number: {line}"
-                    )
+            except ValueError as e:
+                logger.warning(f"Skipping CONECT with invalid serial number: {line}")
 
     # Log connectivity info
     total_connections = sum(len(v) for v in conect_dict.values())
@@ -1162,11 +1166,18 @@ def check_clashes(
     Returns:
         Tuple of (has_clashes, num_clashing_atoms)
     """
+    # Vectorized computation of all pairwise distances
     num_clashing = 0
-    for coord in coords:
-        dists = np.sqrt(np.sum((protein_coords - coord) ** 2, axis=1))
-        if np.any(dists < cutoff):
+
+    # For each atom in the test molecule
+    for i, coord in enumerate(coords):
+        # Calculate distances to all protein atoms
+        distances = np.sqrt(np.sum((protein_coords - coord) ** 2, axis=1))
+
+        # Check if this atom clashes with any protein atom
+        if np.any(distances < cutoff):
             num_clashing += 1
+
     return num_clashing > 0, num_clashing
 
 
@@ -1218,9 +1229,9 @@ def assign_chain_ids(
                     residue_atoms[residue.id] = {"non_protein": [], "residue": residue}
                 residue_atoms[residue.id]["non_protein"].append(atom)
         else:
-                if residue.id not in residue_atoms:
-                    residue_atoms[residue.id] = {"protein": [], "residue": residue}
-                residue_atoms[residue.id]["protein"].append(atom)
+            if residue.id not in residue_atoms:
+                residue_atoms[residue.id] = {"protein": [], "residue": residue}
+            residue_atoms[residue.id]["protein"].append(atom)
 
         # Create chain D for non-protein atoms (potential ligand)
         if any("non_protein" in atoms for atoms in residue_atoms.values()):
@@ -1302,43 +1313,58 @@ def assign_chain_ids(
             structure.original_conect = new_conect
 
 
-def parse_reference_data(reference_pdb: str, logger: logging.Logger) -> bool:
-    """Parse and store reference data in an optimized format.
+def parse_reference_data(
+    ref_pdb_path: str, logger: Optional[logging.Logger] = None
+) -> Dict[str, Any]:
+    """Parse reference PDB file.
 
     Args:
-        reference_pdb: Path to reference PDB file
+        ref_pdb_path: Path to reference PDB file
         logger: Logger instance
 
     Returns:
-        True if successful, False otherwise
+        Dictionary of reference data
     """
     try:
-        # Parse reference PDB file
+        if logger:
+            logger.info(f"Parsing reference PDB: {ref_pdb_path}")
+
         parser = PDBParser(QUIET=True)
-        structure = parser.get_structure("reference", reference_pdb)
+        structure = parser.get_structure("ref", ref_pdb_path)
         model = structure[0]
 
-        # Get CONECT records first
-        conect_dict = parse_conect_records(reference_pdb)
-        if not conect_dict:
-            logger.error("No CONECT records found in reference structure")
-            return False
+        # Get reference ligand atoms (chain D)
+        ref_ligand_atoms = []
+        if "D" in model:
+            ref_ligand_chain = model["D"]
+            if logger:
+                logger.info(
+                    f"Found chain D with {len(list(ref_ligand_chain.get_residues()))} residues"
+                )
 
-        # Extract ligand chain (D) and create molecular graph
-        if "D" not in model:
-            logger.error("No chain D found in reference structure")
-            return False
+            for residue in ref_ligand_chain:
+                if logger:
+                    logger.info(f"Processing residue {residue.resname} {residue.id[1]}")
+                for atom in residue:
+                    ref_ligand_atoms.append(atom)
 
-        ligand_chain = model["D"]
-        ligand_atoms = list(ligand_chain.get_atoms())
-        ligand_coords = np.array([atom.get_coord() for atom in ligand_atoms])
+        if not ref_ligand_atoms:
+            if logger:
+                logger.error("No ligand atoms found in chain D of reference structure")
+            raise ValueError("No ligand atoms found in chain D of reference structure")
 
-        # Create molecular graph for ligand
+        if logger:
+            logger.info(f"Found {len(ref_ligand_atoms)} reference ligand atoms")
+            logger.info(
+                f"First few ligand atoms: {[atom.name for atom in ref_ligand_atoms[:5]]}"
+            )
+
+        # Create molecular graph for reference ligand
         ref_ligand_graph = MolecularGraph(
-            ligand_atoms,
+            ref_ligand_atoms,
             logger=logger,
             name="reference",
-            conect_dict=conect_dict,
+            conect_dict=parse_conect_records(ref_pdb_path, chain_id="D"),
             is_reference=True,
         )
 
@@ -1348,32 +1374,32 @@ def parse_reference_data(reference_pdb: str, logger: logging.Logger) -> bool:
         for chain_id in ["A", "B", "C"]:
             if chain_id in model:
                 chain = model[chain_id]
+                if logger:
+                    logger.info(
+                        f"Found chain {chain_id} with {len(list(chain.get_residues()))} residues"
+                    )
                 for atom in chain.get_atoms():
                     protein_coords.append(atom.get_coord())
                     protein_atoms.append(atom)
 
-        if not protein_coords:
-            logger.warning("No protein atoms found in chains A,B,C")
-            protein_coords = np.empty((0, 3))
-        else:
-            protein_coords = np.array(protein_coords)
+        if logger:
+            logger.info(f"Found {len(protein_coords)} reference protein atoms")
 
-        # Cache reference data
-        _REFERENCE_DATA["target_protein_coords"] = protein_coords
-        _REFERENCE_DATA["ref_ligand_graph"] = ref_ligand_graph
-        _REFERENCE_DATA["ref_ligand_coords"] = ligand_coords
-        _REFERENCE_DATA["ref_conect"] = conect_dict
-
-        # Log success with details
-        logger.info(f"Successfully cached reference data:")
-        logger.info(f"- Protein atoms: {len(protein_coords)}")
-        logger.info(f"- Ligand atoms: {len(ligand_atoms)}")
-        logger.info(f"- CONECT records: {len(conect_dict)}")
-        return True
-
+        return {
+            "ref_pdb_path": ref_pdb_path,
+            "ref_ligand_atoms": ref_ligand_atoms,
+            "ref_ligand_graph": ref_ligand_graph,
+            "target_protein_coords": (
+                np.array(protein_coords) if protein_coords else np.array([])
+            ),
+            "target_protein_atoms": protein_atoms,
+            "pdb_parser": parser,
+        }
     except Exception as e:
-        logger.error(f"Failed to parse reference data: {str(e)}")
-        return False
+        if logger:
+            logger.error(f"Error parsing reference data: {str(e)}")
+            logger.error(traceback.format_exc())
+        raise
 
 
 def process_model(
@@ -1381,53 +1407,112 @@ def process_model(
 ) -> Optional[Dict[str, Any]]:
     """Process a single test compound model.
 
-    This function reuses isomorphic mappings for subsequent models of the same compound.
-
     Args:
-        test_compound: BioPython Structure object for the test compound
-        model_idx: Model index in trajectory
+        test_compound: Test compound structure
+        model_idx: Model index
         logger: Logger instance
 
     Returns:
-        Dictionary with alignment results or None if failed
+        Dictionary with results or None if processing failed
     """
     try:
-        # Get compound ID from structure
-        compound_id = test_compound._id
+        # Get the compound ID - use the path as fallback
+        try:
+            compound_id = test_compound.get_parent().id
+        except (AttributeError, TypeError):
+            # Fallback to using model index as the compound ID
+            compound_id = f"model_{model_idx}"
+            logger.info(f"Using fallback compound ID: {compound_id}")
 
-        # Check if we have cached isomorphic mapping
-        if model_idx == 0 or compound_id not in _ISOMORPHIC_CACHE:
-            # First model or new compound - need to find isomorphic mapping
-            logger.info(f"Finding isomorphic mapping for compound {compound_id}")
+        # Log basic info about test compound
+        logger.info(f"Processing model {model_idx} of compound {compound_id}")
 
-            # Parse CONECT records and create molecular graph
-            test_conect = parse_conect_records(compound_id)
-            if not test_conect:
-                logger.error(f"No CONECT records found for test compound {compound_id}")
-                return None
+        try:
+            atoms_count = len(list(test_compound.get_atoms()))
+            logger.info(f"Structure has {atoms_count} atoms")
+        except Exception as e:
+            logger.warning(f"Could not count atoms: {str(e)}")
+            atoms_count = 0
 
-            # Assign atoms to chains
-            assign_chain_ids(test_compound, logger)
+        # Get test atoms more robustly
+        test_atoms = []
+        try:
+            # Log chains and residues for debugging
+            chains = list(test_compound.get_chains())
+            chain_ids = [chain.id for chain in chains]
+            logger.info(f"Chains in test structure: {chain_ids}")
 
-            # Get chain D (non-protein atoms)
-            model = test_compound[0]
-            if "D" not in model:
+            for chain in chains:
+                try:
+                    residues = list(chain.get_residues())
+                    residue_ids = [f"{res.resname}_{res.id[1]}" for res in residues]
+                    logger.info(
+                        f"Chain {chain.id} has {len(residues)} residues: {residue_ids[:5]}"
+                    )
+
+                    # Get atoms from residues
+                    for residue in residues:
+                        for atom in residue:
+                            test_atoms.append(atom)
+                except Exception as e:
+                    logger.warning(
+                        f"Error getting residues for chain {chain.id}: {str(e)}"
+                    )
+        except Exception as e:
+            logger.warning(f"Error getting chains: {str(e)}, trying direct atom access")
+            logger.info(
+                "No atoms found through chain/residue hierarchy, trying direct atom access"
+            )
+            try:
+                test_atoms = list(test_compound.get_atoms())
+            except Exception as e2:
                 logger.warning(
-                    f"No non-protein atoms found to match in model {model_idx}"
+                    f"Error getting test atoms through structure hierarchy: {str(e2)}"
                 )
-                return None
 
-            test_chain = model["D"]
-            test_atoms = list(test_chain.get_atoms())
-            if not test_atoms:
-                logger.warning(
-                    f"No atoms found in non-protein chain in model {model_idx}"
+                # Try a direct approach as last resort
+                try:
+                    test_atoms = list(test_compound.get_atoms())
+                except Exception as e3:
+                    logger.error(f"Could not get atoms from test compound: {str(e3)}")
+                    return None
+
+        if not test_atoms:
+            logger.error("No atoms found in test compound")
+            return None
+
+        logger.info(f"Found {len(test_atoms)} atoms in test structure")
+        logger.info(f"First few atom names: {[atom.name for atom in test_atoms[:5]]}")
+
+        # Extract CONECT records from the test compound
+        conect_dict = None
+        if hasattr(test_compound, "_id") and test_compound._id:
+            try:
+                # Extract CONECT records directly from the PDB file
+                pdb_file = test_compound._id
+                conect_dict = parse_conect_records(pdb_file)
+                logger.info(
+                    f"Found {len(conect_dict)} CONECT records in test structure"
                 )
-                return None
+            except Exception as e:
+                logger.warning(f"Error extracting CONECT records: {str(e)}")
 
-            # Create molecular graph for test compound
-            test_graph = MolecularGraph(
-                test_atoms, logger=logger, name="test_compound", conect_dict=test_conect
+        # Create molecular graph with the correct parameter order
+        test_graph = MolecularGraph(
+            atoms=test_atoms,
+            logger=logger,  # Pass logger correctly
+            name="test_compound",
+            conect_dict=conect_dict,
+            structure=test_compound,
+            chain_id=None,
+            is_reference=False,
+            require_conect=False,  # Don't require CONECT records
+        )
+
+        # Check if we have a cached mapping
+        if compound_id not in _ISOMORPHIC_CACHE:
+            logger.info(
+                f"No cached mapping found for {compound_id}, calculating isomorphic match"
             )
 
             # Find isomorphic mapping
@@ -1436,7 +1521,24 @@ def process_model(
 
             if not result.isomorphic_match:
                 logger.warning(f"No matching substructure found in model {model_idx}")
+                logger.info(
+                    f"Reference ligand has {len(_REFERENCE_DATA['ref_ligand_graph'].atoms)} atoms"
+                )
+                logger.info(f"Test compound has {len(test_graph.atoms)} atoms")
+                logger.info(
+                    f"Reference atom names: {[atom.name for atom in _REFERENCE_DATA['ref_ligand_graph'].atoms]}"
+                )
+                logger.info(
+                    f"Test atom names: {[atom.name for atom in test_graph.atoms]}"
+                )
                 return None
+
+            logger.info(
+                f"Found isomorphic match with {len(result.matched_pairs)} atom pairs"
+            )
+            logger.info(
+                f"Matched pairs: {[(p[0].name, p[1].name) for p in result.matched_pairs[:5]]}"
+            )
 
             # Cache the mapping and atom indices for future models
             _ISOMORPHIC_CACHE[compound_id] = {
@@ -1450,19 +1552,16 @@ def process_model(
         matched_pairs = cached["matched_pairs"]
         test_atoms = cached["test_atoms"]
 
-        # Create mapping from reference atom index to matched test atom
-        ref_to_test = {}
-        for ref_atom, test_atom in matched_pairs:
-            ref_idx = _REFERENCE_DATA["ref_ligand_graph"].atoms.index(ref_atom)
-            ref_to_test[ref_idx] = test_atom
+        logger.info(
+            f"Using {len(matched_pairs)} matched atom pairs for superimposition"
+        )
 
         # Get coordinates for matched atoms
         ref_coords = []
         test_coords = []
-        for i, ref_atom in enumerate(_REFERENCE_DATA["ref_ligand_graph"].atoms):
-            if i in ref_to_test:
-                ref_coords.append(ref_atom.coord)
-                test_coords.append(ref_to_test[i].coord)
+        for ref_atom, test_atom in matched_pairs:
+            ref_coords.append(ref_atom.coord)
+            test_coords.append(test_atom.coord)
 
         ref_coords = np.array(ref_coords)
         test_coords = np.array(test_coords)
@@ -1486,23 +1585,34 @@ def process_model(
         # Check for clashes with protein
         has_clashes, num_clashing = False, 0
         if len(_REFERENCE_DATA["target_protein_coords"]) > 0:
+            logger.info(
+                f"Checking clashes with {len(_REFERENCE_DATA['target_protein_coords'])} protein atoms"
+            )
             has_clashes, num_clashing = check_clashes(
                 transformed_coords, _REFERENCE_DATA["target_protein_coords"]
             )
-            if logger and has_clashes:
-                logger.warning(f"Detected {num_clashing} atoms with protein clashes")
+            logger.info(
+                f"Has clashes: {has_clashes}, Number of clashing atoms: {num_clashing}"
+            )
 
-        return {
-            "rmsd": float(matched_rmsd),  # RMSD of matched atoms only
+        # Calculate metrics
+        metrics = {
+            "rmsd": float(matched_rmsd),
             "matched_atoms": len(matched_pairs),
             "has_clashes": has_clashes,
-            "num_clashing": num_clashing,
+            "num_clashes": num_clashing,
+            "success": True,
             "rotation": rotation.tolist(),
             "translation": translation.tolist(),
         }
 
+        logger.info(f"Successfully processed model {model_idx}, metrics: {metrics}")
+        return metrics
+
     except Exception as e:
-        logger.error(f"Failed to process test compound model {model_idx}: {str(e)}")
+        if logger:
+            logger.error(f"Error processing model {model_idx}: {str(e)}")
+            logger.error(traceback.format_exc())
         return None
 
 
@@ -1598,15 +1708,15 @@ def calculate_optimal_transform(
 
 
 def process_trajectory(args: Tuple[str, str, bool, Dict[str, Any]]) -> Optional[Dict]:
-    """Process a single trajectory file.
+    """Process a single frame PDB file.
 
     Args:
-        args: Tuple containing (pdb_file, base_dir, verbose, reference_data)
+        args: Tuple containing (frame_file, frame_dir, verbose, reference_data)
 
     Returns:
-        Dictionary of model metrics or None if failed
+        Dictionary of frame metrics or None if failed
     """
-    pdb_file, base_dir, verbose, reference_data = args
+    frame_file, frame_dir, verbose, reference_data = args
 
     # Set up logging for this process
     logger = setup_logging(verbose)
@@ -1616,64 +1726,252 @@ def process_trajectory(args: Tuple[str, str, bool, Dict[str, Any]]) -> Optional[
         global _REFERENCE_DATA
         _REFERENCE_DATA = reference_data
 
-        # Get number of models
-        model_count = count_models_in_pdb(pdb_file)
-        logger.info(f"Processing {model_count} models from {pdb_file}")
-
-        # Create metrics file path
-        metrics_file = Path(pdb_file).parent / "superimposition_metrics.json"
-        metrics = {}
-
-        # Load existing metrics if file exists
-        if metrics_file.exists():
-            try:
-                with open(metrics_file, "r") as f:
-                    metrics = json.load(f)
-            except json.JSONDecodeError:
-                logger.warning(f"Could not read existing metrics file: {metrics_file}")
-
         # Parse structure
         parser = PDBParser(QUIET=True)
-        structure = parser.get_structure(pdb_file, pdb_file)  # Use pdb_file as ID
-        model_count = len(structure)
-        logger.info(f"Processing {model_count} models from {pdb_file}")
+        structure = parser.get_structure("frame", frame_file)
 
-        # Process each model
-        with tqdm(total=model_count, desc="Models", unit="model") as pbar:
-            for model_idx, model in enumerate(structure):
-                # Skip if already processed
-                if str(model_idx + 1) in metrics:
-                    pbar.update(1)
-                    continue
+        if not structure:
+            logger.error(f"Failed to parse structure from {frame_file}")
+            return None
 
-                # Create a new structure for this model
-                model_structure = Structure(pdb_file)  # Use pdb_file as ID
-                model_structure.add(model)
-                model_structure._id = pdb_file  # Set _id for CONECT record parsing
+        # Create a new structure for this frame
+        frame_structure = Structure("frame")
+        frame_structure.add(structure[0])  # Add the first (and only) model
+        frame_structure._id = frame_file  # Set _id for CONECT record parsing
 
-                # Superimpose model
-                result = process_model(model_structure, model_idx, logger)
-                if result:
-                    metrics[str(model_idx + 1)] = result
+        # Get frame number from filename
+        frame_num = int(Path(frame_file).stem.split("_")[1])
 
-                    # Update progress bar
-                    pbar.set_postfix(
+        # Superimpose frame
+        result = process_model(frame_structure, frame_num, logger)
+        if result:
+            # Add frame file information to result
+            result["frame_file"] = frame_file
+            return result
+
+        return None
+
+    except Exception as e:
+        logger.error(f"Failed to process {frame_file}: {str(e)}")
+        return None
+
+
+def save_simple_superimposed_structure(
+    frame_file: str,
+    metrics: Dict[str, Any],
+    ref_pdb_path: str,
+    output_dir: Optional[Path],
+    logger: logging.Logger,
+) -> Optional[Path]:
+    """Save a superimposed structure as a PDB file using a simple approach.
+
+    This function creates a PDB file by:
+    1. Creating a copy of the reference PDB file
+    2. Extracting just the protein chains (A, B, C) and ligand chain (D)
+    3. Appending the transformed test ligand coordinates as chain E
+    4. Adding CONECT records for test structure and cyclic bond if needed
+
+    Args:
+        frame_file: Path to the test compound frame file
+        metrics: Dictionary with metrics including rotation and translation
+        ref_pdb_path: Path to the reference PDB file
+        output_dir: Directory to save output PDB files
+        logger: Logger instance
+
+    Returns:
+        Path to the saved PDB file or None if failed
+    """
+    try:
+        # Ensure output directory exists
+        if output_dir is None:
+            # Create default output directory in the same directory as frame_file
+            frame_path = Path(frame_file)
+            output_dir = frame_path.parent.parent / "superimposed"
+
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        # Get frame number from filename
+        frame_name = Path(frame_file).stem
+
+        # Create output file path
+        output_file = output_dir / f"superimposed_{frame_name}.pdb"
+
+        logger.info(f"Saving superimposed structure for {frame_name} to {output_file}")
+
+        # Parse reference and test structures
+        with open(frame_file, "r") as f:
+            test_lines = f.readlines()
+
+        # Create a new PDB file
+        with open(output_file, "w") as f:
+            # Write a header
+            f.write(f"REMARK   4 Superimposed structure\n")
+            f.write(f"REMARK   4 Reference: {ref_pdb_path}\n")
+            f.write(f"REMARK   4 Test: {frame_file}\n")
+            f.write(f"REMARK   4 RMSD: {metrics.get('rmsd', 0.0):.3f} Angstroms\n")
+            f.write(f"REMARK   4 Matched atoms: {metrics.get('matched_atoms', 0)}\n")
+            f.write(f"REMARK   4 Has clashes: {metrics.get('has_clashes', False)}\n")
+            f.write(f"REMARK   4 Number of clashes: {metrics.get('num_clashes', 0)}\n")
+
+            # Copy reference PDB content (chains A, B, C, D)
+            with open(ref_pdb_path, "r") as ref_file:
+                for line in ref_file:
+                    if line.startswith("ATOM") or line.startswith("HETATM"):
+                        chain_id = line[21:22]
+                        if chain_id in ["A", "B", "C", "D"]:
+                            f.write(line)
+                    elif line.startswith("TER"):
+                        f.write(line)
+                    elif line.startswith("CONECT"):
+                        # Keep CONECT records from reference
+                        f.write(line)
+
+            # Get transformation data
+            if "rotation" not in metrics or "translation" not in metrics:
+                logger.error(f"Missing transformation data for {frame_name}")
+                return None
+
+            rotation = np.array(metrics["rotation"])
+            translation = np.array(metrics["translation"])
+
+            # Find original serial numbers and map to new ones
+            atom_id_map = {}
+            atom_num = 10001  # Start with high serial numbers to avoid conflicts
+
+            # Process test frame atoms
+            test_coords = []
+            test_atom_info = []
+
+            for line in test_lines:
+                if line.startswith("ATOM") or line.startswith("HETATM"):
+                    # Extract original serial number
+                    orig_serial = int(line[6:11].strip())
+                    atom_id_map[orig_serial] = atom_num
+
+                    # Extract coordinates
+                    x = float(line[30:38])
+                    y = float(line[38:46])
+                    z = float(line[46:54])
+                    coords = np.array([x, y, z])
+                    test_coords.append(coords)
+
+                    # Store atom info for later
+                    test_atom_info.append(
                         {
-                            "RMSD": f"{result['rmsd']:.4f}",
-                            "Clashes": result["has_clashes"],
+                            "line": line,
+                            "serial": orig_serial,
+                            "name": line[12:16].strip(),
+                            "resname": line[17:20].strip(),
+                            "resnum": int(line[22:26].strip()),
+                            "element": (
+                                line[76:78].strip()
+                                if len(line) >= 78
+                                else line[12:16].strip()[0]
+                            ),
                         }
                     )
 
-                    # Save metrics after each model
-                    with open(metrics_file, "w") as f:
-                        json.dump(metrics, f, indent=2)
+                    atom_num += 1
 
-                pbar.update(1)
+            # Extract CONECT records from test structure
+            test_connections = defaultdict(list)
+            for line in test_lines:
+                if line.startswith("CONECT"):
+                    parts = line.split()
+                    if len(parts) < 2:
+                        continue
+                    try:
+                        atom_serial = int(parts[1])
+                        for i in range(2, len(parts)):
+                            try:
+                                connected_serial = int(parts[i])
+                                test_connections[atom_serial].append(connected_serial)
+                            except ValueError:
+                                continue
+                    except ValueError:
+                        continue
 
-        return metrics
+            # Apply transformation to all atoms
+            transformed_coords = []
+            for coord in test_coords:
+                new_coord = np.dot(coord, rotation) + translation
+                transformed_coords.append(new_coord)
+
+            # Write transformed coordinates as chain E
+            for i, (coord, atom_info) in enumerate(
+                zip(transformed_coords, test_atom_info)
+            ):
+                serial = atom_id_map[atom_info["serial"]]
+                atom_name = atom_info["name"]
+                residue_name = atom_info["resname"]
+                residue_num = atom_info["resnum"]
+                element = atom_info["element"]
+
+                line = f"ATOM  {serial:5d} {atom_name:4s} {residue_name:3s} E{residue_num:4d}    "
+                line += f"{coord[0]:8.3f}{coord[1]:8.3f}{coord[2]:8.3f}"
+                line += f"  1.00  0.00          {element:>2s}  \n"
+
+                f.write(line)
+
+            # Add TER record
+            f.write("TER\n")
+
+            # Add CONECT records for test structure
+            for orig_serial, connections in test_connections.items():
+                if orig_serial in atom_id_map:
+                    new_id = atom_id_map[orig_serial]
+                    conect_line = f"CONECT{new_id:5d}"
+
+                    for connected_serial in connections:
+                        if connected_serial in atom_id_map:
+                            conect_line += f"{atom_id_map[connected_serial]:5d}"
+
+                    conect_line += "\n"
+                    f.write(conect_line)
+
+            # Add cyclic peptide bond if needed
+            # Find first and last residue numbers
+            if test_atom_info:
+                residue_nums = [info["resnum"] for info in test_atom_info]
+                min_res = min(residue_nums)
+                max_res = max(residue_nums)
+
+                # Find N atom in first residue and C atom in last residue
+                first_N = None
+                last_C = None
+
+                for info in test_atom_info:
+                    if info["resnum"] == min_res and info["name"] == "N":
+                        first_N = info["serial"]
+                    if info["resnum"] == max_res and info["name"] == "C":
+                        last_C = info["serial"]
+
+                # Add cyclic connection if both atoms found and not already connected
+                if first_N is not None and last_C is not None:
+                    if first_N in atom_id_map and last_C in atom_id_map:
+                        # Check if connection already exists
+                        if last_C not in test_connections.get(
+                            first_N, []
+                        ) and first_N not in test_connections.get(last_C, []):
+                            logger.info(
+                                f"Adding cyclic peptide connection between residues {min_res} and {max_res}"
+                            )
+
+                            # Add CONECT record
+                            new_first_N = atom_id_map[first_N]
+                            new_last_C = atom_id_map[last_C]
+                            f.write(f"CONECT{new_first_N:5d}{new_last_C:5d}\n")
+                            f.write(f"CONECT{new_last_C:5d}{new_first_N:5d}\n")
+
+            # End the file
+            f.write("END\n")
+
+        logger.info(f"Successfully saved superimposed structure to {output_file}")
+        return output_file
 
     except Exception as e:
-        logger.error(f"Failed to process {pdb_file}: {str(e)}")
+        logger.error(f"Error saving superimposed structure: {str(e)}")
+        traceback.print_exc()
         return None
 
 
@@ -1682,7 +1980,9 @@ def main():
     parser = argparse.ArgumentParser(
         description="Superimpose ligands onto a reference structure using RDKit MCS."
     )
-    parser.add_argument("base_dir", help="Base directory containing md_Ref.pdb files")
+    parser.add_argument(
+        "base_dir", help="Base directory containing pdb_frames directories"
+    )
     parser.add_argument(
         "reference_pdb",
         help="Reference PDB file with protein (chains A,B,C) and ligand (chain D)",
@@ -1699,8 +1999,32 @@ def main():
         help="Force reprocessing of already processed files",
     )
     parser.add_argument("--verbose", action="store_true", help="Enable verbose output")
+    parser.add_argument(
+        "--save-structures",
+        action="store_true",
+        help="Save the first 5 superimposed structures as PDB files",
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=str,
+        default=None,
+        help="Directory to save superimposed structures (default: base_dir/superimposed)",
+    )
 
     args = parser.parse_args()
+
+    # Check for required modules
+    missing_modules = []
+    if not BIOPYTHON_AVAILABLE:
+        missing_modules.append("biopython")
+
+    if missing_modules:
+        print("ERROR: Required modules are missing:")
+        for module in missing_modules:
+            print(f"  - {module}")
+        print("\nPlease install them with:")
+        print(f"  pip install {' '.join(missing_modules)}")
+        return 1
 
     # Set up logging
     logging.basicConfig(
@@ -1711,67 +2035,349 @@ def main():
 
     # Initialize reference data
     print("\nInitializing reference structures...")
-    if not parse_reference_data(args.reference_pdb, logger):
-        return
+    try:
+        global _REFERENCE_DATA
+        _REFERENCE_DATA = parse_reference_data(args.reference_pdb, logger)
+    except Exception as e:
+        print(f"Error parsing reference data: {str(e)}")
+        return 1
 
-    # Find trajectory files
-    print(f"\nSearching for md_Ref.pdb files in {args.base_dir}...")
+    # Set output directory for saved structures
+    output_dir = None
+    if args.save_structures:
+        if args.output_dir:
+            output_dir = Path(args.output_dir)
+        else:
+            output_dir = Path(args.base_dir) / "superimposed"
+
+        try:
+            output_dir.mkdir(parents=True, exist_ok=True)
+            print(f"Will save the first 5 superimposed structures to {output_dir}")
+        except Exception as e:
+            print(f"Warning: Could not create output directory {output_dir}: {str(e)}")
+            print("Will use default directory next to frame files")
+            output_dir = None
+
+    # Find pdb_frames directories and their frame files
+    print(f"\nSearching for frame PDB files in {args.base_dir}...")
     base_path = Path(args.base_dir)
-    pdb_files = list(base_path.rglob("md_Ref.pdb"))
-    pdb_files = [str(path) for path in pdb_files]
+    frame_dirs = list(base_path.rglob("pdb_frames"))
 
-    if not pdb_files:
-        print(f"No md_Ref.pdb files found in {args.base_dir}")
-        return
+    if not frame_dirs:
+        print(f"No pdb_frames directories found in {args.base_dir}")
+        return 1
 
-    print(f"Found {len(pdb_files)} files to process")
+    # Collect all frame files
+    frame_files = []
+    skipped_dirs = []
+    for frame_dir in frame_dirs:
+        # Get all frame_*.pdb files in this directory
+        frames = sorted(frame_dir.glob("frame_*.pdb"))
+        if not frames:
+            continue
+
+        # Create metrics file path for this directory
+        metrics_file = frame_dir / "superimposition_metrics.json"
+
+        # Check if directory is already fully processed
+        if not args.force and metrics_file.exists():
+            try:
+                with open(metrics_file, "r") as f:
+                    metrics = json.load(f)
+                    # Check if we have metrics for all frames
+                    if len(metrics) == len(frames):
+                        # Verify metrics are valid
+                        all_valid = all(
+                            isinstance(m, dict) and "rmsd" in m and "has_clashes" in m
+                            for m in metrics.values()
+                        )
+                        if all_valid:
+                            print(f"Skipping already processed directory: {frame_dir}")
+                            skipped_dirs.append(frame_dir)
+                            continue
+            except (json.JSONDecodeError, KeyError):
+                # If metrics file is invalid, we'll reprocess
+                pass
+
+        frame_files.extend(frames)
+
+    if not frame_files:
+        if skipped_dirs:
+            print("\nAll directories have been processed. Use --force to reprocess.")
+            print("\nProcessed directories:")
+            for dir_path in skipped_dirs:
+                print(f"  {dir_path}")
+        else:
+            print(f"No frame PDB files found in any pdb_frames directory")
+        return 1
+
+    print(
+        f"\nFound {len(frame_files)} frame files to process in {len(frame_dirs) - len(skipped_dirs)} directories"
+    )
+    if skipped_dirs:
+        print(f"Skipped {len(skipped_dirs)} already processed directories")
+
+    # Limit to first 1000 frames for testing if there are too many
+    if len(frame_files) > 1000:
+        print(f"Limiting to first 1000 frames for processing")
+        frame_files = frame_files[:1000]
 
     # Set number of processes
-    num_processes = args.num_processes or min(os.cpu_count() or 1, len(pdb_files))
+    num_processes = args.num_processes or min(os.cpu_count() or 1, len(frame_files))
     print(f"Using {num_processes} processes")
 
+    # Simple progress reporting
+    def print_progress(current, total, start_time):
+        elapsed_time = time.time() - start_time
+        if elapsed_time > 0 and current > 0:
+            frames_per_second = current / elapsed_time
+            eta = (total - current) / frames_per_second if frames_per_second > 0 else 0
+            eta_str = f"{eta:.1f}s" if eta < 60 else f"{eta/60:.1f}m"
+
+            # Create a simple progress bar
+            bar_len = 30
+            filled_len = int(round(bar_len * current / float(total)))
+            bar = "=" * filled_len + "-" * (bar_len - filled_len)
+
+            sys.stdout.write(
+                f"\r[{bar}] {current}/{total} ({current/total*100:.1f}%) - ETA: {eta_str}"
+            )
+            sys.stdout.flush()
+
     # Process files in parallel
-    with tqdm(total=len(pdb_files), desc="Files", unit="file") as pbar:
+    start_time = time.time()
+    total_frames = len(frame_files)
+    processed_frames = 0
+    print_progress(0, total_frames, start_time)
+
+    # Store frames with successful results for saving later
+    successful_frames = []
+    saved_structures_count = 0
+
+    # If save_structures is enabled, process a few frames first to get some saved structures
+    if args.save_structures:
+        # Take the first 20 frames to process first, one at a time, until we get 5 successful ones
+        frames_to_try = frame_files[: min(20, len(frame_files))]
+        print(
+            f"\nProcessing first {len(frames_to_try)} frames to find successful superimpositions..."
+        )
+
+        for i, frame_file in enumerate(frames_to_try):
+            frame_path = str(frame_file)
+            frame_dir = str(frame_file.parent)
+            result = process_trajectory(
+                (frame_path, frame_dir, args.verbose, _REFERENCE_DATA)
+            )
+
+            if result and result.get("success", False):
+                print(f"Found successful superimposition: {frame_file.name}")
+                successful_frames.append((frame_path, result))
+
+                # Save this structure
+                if len(successful_frames) <= 5:
+                    saved_file = save_simple_superimposed_structure(
+                        frame_path, result, args.reference_pdb, output_dir, logger
+                    )
+                    if saved_file:
+                        saved_structures_count += 1
+
+                # Once we have 5, we can stop
+                if len(successful_frames) >= 5:
+                    print(
+                        f"Found 5 successful superimpositions, continuing with bulk processing..."
+                    )
+                    break
+
+            # Update progress
+            processed_frames += 1
+            if i % 5 == 0:  # Only update occasionally
+                print(
+                    f"Processed {i+1}/{len(frames_to_try)} frames, found {len(successful_frames)} successful superimpositions"
+                )
+
+        # Remove the frames we've already processed from the list
+        frame_files = [
+            f for f in frame_files if str(f) not in [x[0] for x in successful_frames]
+        ]
+
+    # Now process the rest of the frames
+    if frame_files:
         with ProcessPoolExecutor(max_workers=num_processes) as executor:
             futures = []
 
-            for pdb_file in pdb_files:
-                if not args.force:
-                    metrics_file = (
-                        Path(pdb_file).parent / "superimposition_metrics.json"
-                    )
-                    if metrics_file.exists():
-                    pbar.update(1)
-                    continue
+            # Group frame files by their parent directory
+            frame_groups = {}
+            for frame_file in frame_files:
+                parent_dir = frame_file.parent
+                if parent_dir not in frame_groups:
+                    frame_groups[parent_dir] = []
+                frame_groups[parent_dir].append(frame_file)
 
-                futures.append(
-                    executor.submit(
-                        process_trajectory,
-                        (pdb_file, args.base_dir, args.verbose, _REFERENCE_DATA),
+            # Process each directory's frames
+            for frame_dir, dir_frames in frame_groups.items():
+                metrics_file = frame_dir / "superimposition_metrics.json"
+                metrics = {}
+
+                # Load existing metrics if they exist
+                if metrics_file.exists():
+                    try:
+                        with open(metrics_file, "r") as f:
+                            metrics = json.load(f)
+                    except json.JSONDecodeError:
+                        logger.warning(
+                            f"Could not read existing metrics file: {metrics_file}"
+                        )
+
+                # Submit each frame for processing
+                for frame_file in dir_frames:
+                    frame_num = frame_file.stem.split("_")[1]
+                    # Only skip if we have valid metrics for this frame
+                    if not args.force and str(frame_num) in metrics:
+                        try:
+                            frame_metrics = metrics[str(frame_num)]
+                            if (
+                                isinstance(frame_metrics, dict)
+                                and "rmsd" in frame_metrics
+                                and "has_clashes" in frame_metrics
+                            ):
+                                processed_frames += 1
+                                print_progress(
+                                    processed_frames, total_frames, start_time
+                                )
+                                continue
+                        except (KeyError, TypeError):
+                            pass
+
+                    futures.append(
+                        executor.submit(
+                            process_trajectory,
+                            (
+                                str(frame_file),
+                                str(frame_dir),
+                                args.verbose,
+                                _REFERENCE_DATA,
+                            ),
+                        )
                     )
-                )
 
             # Process results as they complete
             for future in as_completed(futures):
                 result = future.result()
-                pbar.update(1)
+                processed_frames += 1
+                print_progress(processed_frames, total_frames, start_time)
 
                 if result:
-                    avg_rmsd = np.mean([m["rmsd"] for m in result.values()])
-                    clashes = sum(1 for m in result.values() if m["has_clashes"])
-                    pbar.set_postfix(
-                        {
-                            "Avg RMSD": f"{avg_rmsd:.4f}",
-                            "Clashes": f"{clashes}/{len(result)}",
-                        }
-                    )
+                    # Get the directory and update its metrics file
+                    frame_file = result.get("frame_file")
+                    if frame_file:
+                        frame_dir = Path(frame_file).parent
+                        metrics_file = frame_dir / "superimposition_metrics.json"
+
+                        # Load current metrics
+                        current_metrics = {}
+                        if metrics_file.exists():
+                            try:
+                                with open(metrics_file, "r") as f:
+                                    current_metrics = json.load(f)
+                            except json.JSONDecodeError:
+                                pass
+
+                        # Update with new result
+                        frame_num = Path(frame_file).stem.split("_")[1]
+                        current_metrics[str(frame_num)] = result
+
+                        # Save updated metrics
+                        with open(metrics_file, "w") as f:
+                            json.dump(current_metrics, f, indent=2)
+
+                        # Track successful results for saving structures later
+                        if result.get("success", False) and len(successful_frames) < 5:
+                            successful_frames.append((frame_file, result))
+
+    print("\n")  # New line after progress bar
+
+    # After processing is complete, save any remaining structures needed to reach 5
+    if args.save_structures and successful_frames:
+        structures_to_save = 5 - saved_structures_count
+        if structures_to_save > 0 and len(successful_frames) > saved_structures_count:
+            print(
+                f"\nSaving {min(structures_to_save, len(successful_frames) - saved_structures_count)} more superimposed structures..."
+            )
+            for frame_file, result in successful_frames[saved_structures_count:]:
+                if saved_structures_count >= 5:
+                    break
+
+                saved_file = save_simple_superimposed_structure(
+                    frame_file,
+                    result,
+                    args.reference_pdb,
+                    output_dir,
+                    logger,
+                )
+                if saved_file:
+                    saved_structures_count += 1
+                    print(f"Saved superimposed structure for {Path(frame_file).name}")
+
+    # After all processing is done, generate CSV files for each directory
+    print("\nGenerating CSV result files...")
+    for frame_dir in frame_dirs:
+        metrics_file = frame_dir / "superimposition_metrics.json"
+        if metrics_file.exists():
+            try:
+                # Create CSV file in the parent directory (e.g., x_177/superimposition_results.csv)
+                csv_file = frame_dir.parent / "superimposition_results.csv"
+
+                # Load metrics
+                with open(metrics_file, "r") as f:
+                    metrics = json.load(f)
+
+                if not metrics:
+                    print(f"No metrics found for {frame_dir}, skipping CSV generation")
+                    continue
+
+                # Convert JSON to CSV
+                with open(csv_file, "w") as f:
+                    # Write header
+                    header = [
+                        "frame",
+                        "rmsd",
+                        "matched_atoms",
+                        "has_clashes",
+                        "num_clashes",
+                        "success",
+                    ]
+                    f.write(",".join(header) + "\n")
+
+                    # Write rows
+                    for frame_num, frame_metrics in sorted(
+                        metrics.items(), key=lambda x: int(x[0])
+                    ):
+                        if isinstance(frame_metrics, dict):
+                            row = [
+                                f"frame_{frame_num}",
+                                str(frame_metrics.get("rmsd", 0)),
+                                str(frame_metrics.get("matched_atoms", 0)),
+                                str(frame_metrics.get("has_clashes", False)),
+                                str(frame_metrics.get("num_clashes", 0)),
+                                str(frame_metrics.get("success", False)),
+                            ]
+                            f.write(",".join(row) + "\n")
+
+                print(f"Created CSV results file: {csv_file}")
+            except Exception as e:
+                print(f"Error generating CSV for {frame_dir}: {str(e)}")
+
+    if args.save_structures:
+        print(
+            f"\nSaved {saved_structures_count} superimposed structures to {output_dir}"
+        )
 
     print("\nSuperimposition complete!")
 
 
 def create_rdkit_mol_from_chain(
     chain: Chain, conect_dict: Dict[int, List[int]], logger: logging.Logger
-) -> Optional[rdkit.Chem.Mol]:
+) -> Optional[Any]:
     """Create an RDKit molecule from a BioPython chain and CONECT records.
 
     Args:
@@ -1828,6 +2434,94 @@ def create_rdkit_mol_from_chain(
 
     except Exception as e:
         logger.error(f"Failed to create RDKit molecule: {str(e)}")
+        return None
+
+
+def get_molblock_from_pdb(
+    pdb_file: str, chain_id: str = "D", remove_hs: bool = False
+) -> Optional[str]:
+    """Convert a PDB file to an MDL molblock string.
+
+    Args:
+        pdb_file: PDB file path
+        chain_id: Chain ID to extract
+        remove_hs: Whether to remove hydrogens
+
+    Returns:
+        MDL molblock string or None if conversion failed
+    """
+    if not RDKIT_AVAILABLE:
+        return None
+
+    try:
+        # Read PDB file and convert to RDKit molecule
+        mol = Chem.MolFromPDBFile(
+            pdb_file,
+            sanitize=True,
+            removeHs=remove_hs,
+            flavor=Chem.PDBFlavor.AllChem,
+        )
+        if mol is None:
+            return None
+
+        # Filter by chain ID if specified
+        if chain_id:
+            atoms_to_keep = []
+            for atom in mol.GetAtoms():
+                info = atom.GetPDBResidueInfo()
+                if info and info.GetChainId() == chain_id:
+                    atoms_to_keep.append(atom.GetIdx())
+
+            if atoms_to_keep:
+                mol = Chem.PathToSubmol(mol, atoms_to_keep)
+
+        # Generate molblock
+        return Chem.MolToMolBlock(mol)
+    except Exception:
+        return None
+
+
+def molecule_from_pdb_file(
+    pdb_file: str, chain_id: Optional[str] = None, remove_hs: bool = False
+) -> Optional[Any]:
+    """Create an RDKit molecule from a PDB file.
+
+    Args:
+        pdb_file: Path to PDB file
+        chain_id: Optional chain ID to extract (default: all chains)
+        remove_hs: Whether to remove hydrogens
+
+    Returns:
+        RDKit molecule or None if conversion failed
+    """
+    if not RDKIT_AVAILABLE:
+        return None
+
+    try:
+        # Read PDB file and convert to RDKit molecule
+        mol = Chem.MolFromPDBFile(
+            pdb_file,
+            sanitize=True,
+            removeHs=remove_hs,
+            flavor=Chem.PDBFlavor.AllChem,
+        )
+        if mol is None:
+            return None
+
+        # Filter by chain ID if specified
+        if chain_id:
+            atoms_to_keep = []
+            for atom in mol.GetAtoms():
+                info = atom.GetPDBResidueInfo()
+                if info and info.GetChainId() == chain_id:
+                    atoms_to_keep.append(atom.GetIdx())
+
+            if atoms_to_keep:
+                mol = Chem.PathToSubmol(mol, atoms_to_keep)
+
+        # Generate molblock
+        return Chem.MolToMolBlock(mol)
+    except Exception:
         return None
 
 
